@@ -27,6 +27,8 @@ pollster = "1.0"
 tracing = "0.1"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false }
+base64-simd = "0.8"
+flate2 = "1.1"
 
 [dev-dependencies]
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }

@@ -40,6 +40,7 @@
 mod app;
 pub mod gpu;
 pub mod gradient;
+pub mod kitty;
 pub mod node;
 mod renderer;
 pub mod style;
