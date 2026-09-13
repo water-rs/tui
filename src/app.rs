@@ -1,9 +1,10 @@
 //! The terminal event loop.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::future::Future;
 use std::io::{self, Stdout, stdout};
 use std::panic;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -38,10 +39,10 @@ use crate::theme::install_terminal_theme;
 ///
 /// Returns terminal I/O errors from `crossterm`/`ratatui`.
 pub fn run<V: View>(view: impl FnOnce() -> V) -> io::Result<()> {
-    init_executors();
+    let local_tasks = init_executors();
     let mut env = Environment::new();
     install_terminal_theme(&mut env);
-    run_inner(view(), env)
+    run_inner(view(), env, local_tasks)
 }
 
 /// Runs a WaterUI [`App`] as a full-screen terminal application.
@@ -60,7 +61,7 @@ pub fn run<V: View>(view: impl FnOnce() -> V) -> io::Result<()> {
 ///
 /// Returns terminal I/O errors from `crossterm`/`ratatui`.
 pub fn run_app(app: impl FnOnce() -> App) -> io::Result<()> {
-    init_executors();
+    let local_tasks = init_executors();
     let (mut windows, _menu_bar, mut env) = app().into_parts();
     install_terminal_theme(&mut env);
     assert!(
@@ -70,22 +71,29 @@ pub fn run_app(app: impl FnOnce() -> App) -> io::Result<()> {
         windows.len()
     );
     let window = windows.pop().expect("the main window exists");
-    run_inner(window.build_content(), env)
+    run_inner(window.build_content(), env, local_tasks)
 }
 
-/// Installs the global and thread-local executors before any app code runs.
+/// Installs the global and thread-local executors before any app code runs,
+/// returning the queue the event loop drains `spawn_local` work from.
 ///
 /// `spawn` work goes to the platform's native executor; `spawn_local` work is
 /// parked and drained between frames by the event loop so it never re-enters
 /// the code that spawned it.
-fn init_executors() {
+fn init_executors() -> mpsc::Receiver<Runnable> {
+    let (runnable_tx, runnable_rx) = mpsc::channel();
     let _ = executor_core::try_init_global_executor(native_executor::NativeExecutor::new());
     let _ = executor_core::try_init_local_executor(
-        waterui_internal::task::monitored_local_executor(TuiLocalExecutor),
+        waterui_internal::task::monitored_local_executor(TuiLocalExecutor { runnable_tx }),
     );
+    runnable_rx
 }
 
-fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
+fn run_inner(
+    view: impl View,
+    env: Environment,
+    local_tasks: mpsc::Receiver<Runnable>,
+) -> io::Result<()> {
 
     let mut renderer = TuiRenderer::new();
     let dirty = renderer.dirty();
@@ -106,7 +114,7 @@ fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
     let cursor = Cell::new(None);
 
     'app: loop {
-        if drain_parked_local_work() {
+        if drain_parked_local_work(&local_tasks) {
             dirty.set(true);
         }
         for id in renderer.take_focus_requests() {
@@ -142,7 +150,7 @@ fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
 
         dirty.set(false);
         while !dirty.get() {
-            if drain_parked_local_work() {
+            if drain_parked_local_work(&local_tasks) {
                 dirty.set(true);
                 continue;
             }
@@ -228,16 +236,17 @@ fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
     Ok(())
 }
 
-thread_local! {
-    /// `spawn_local` work parked between frames. Runnables are deliberately not
-    /// run inline: reactive work re-enters the code under render, which
-    /// deadlocks when polled in the middle of the call that spawned it.
-    static PARKED_RUNNABLES: RefCell<Vec<Runnable>> = const { RefCell::new(Vec::new()) };
-}
-
 /// Queues `spawn_local` work for the terminal event loop to drain.
-#[derive(Clone, Copy, Debug, Default)]
-struct TuiLocalExecutor;
+///
+/// A waker fires on whatever thread triggered it — the global executor's
+/// workers included — so the schedule hook sends runnables back to the loop's
+/// thread through a channel instead of touching a thread-local queue.
+/// Runnables are deliberately not run inline either: reactive work re-enters
+/// the code under render, which deadlocks when polled in the middle of the
+/// call that spawned it.
+struct TuiLocalExecutor {
+    runnable_tx: mpsc::Sender<Runnable>,
+}
 
 impl LocalExecutor for TuiLocalExecutor {
     type Task<T: 'static> = AsyncTask<T>;
@@ -246,8 +255,16 @@ impl LocalExecutor for TuiLocalExecutor {
     where
         Fut: Future + 'static,
     {
-        let (runnable, task) = async_task::spawn_local(fut, |runnable: Runnable| {
-            PARKED_RUNNABLES.with(|parked| parked.borrow_mut().push(runnable));
+        let runnable_tx = self.runnable_tx.clone();
+        let (runnable, task) = async_task::spawn_local(fut, move |runnable: Runnable| {
+            if let Err(unsent) = runnable_tx.send(runnable) {
+                // Teardown race: a waker held by another thread fired after
+                // the loop dropped the receiver. Dropping a `spawn_local`
+                // runnable off its spawning thread panics by design
+                // (async-task's thread check), so leak it instead — bounded
+                // to shutdown, reclaimed at process exit.
+                std::mem::forget(unsent);
+            }
         });
         runnable.schedule();
         task
@@ -255,10 +272,10 @@ impl LocalExecutor for TuiLocalExecutor {
 }
 
 /// Runs the work `spawn_local` parked since the last drain, returning whether
-/// any ran. Each drained runnable may park more work; this drains only what was
-/// already queued, so a task that reschedules itself is polled next frame.
-fn drain_parked_local_work() -> bool {
-    let ready = PARKED_RUNNABLES.with(|parked| core::mem::take(&mut *parked.borrow_mut()));
+/// any ran. Each drained runnable may park more work; this drains only what
+/// was already queued, so a task that reschedules itself is polled next frame.
+fn drain_parked_local_work(local_tasks: &mpsc::Receiver<Runnable>) -> bool {
+    let ready: Vec<Runnable> = local_tasks.try_iter().collect();
     let ran = !ready.is_empty();
     for runnable in ready {
         runnable.run();
