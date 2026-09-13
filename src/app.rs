@@ -48,12 +48,19 @@ pub fn run(view: impl View) -> io::Result<()> {
     let mut focus_chain = Vec::new();
     root.collect_focus(&mut focus_chain);
     let mut focused = focus_chain.first().copied();
+    root.sync_focused(focused);
     let cursor = Cell::new(None);
 
     'app: loop {
+        for id in renderer.take_focus_requests() {
+            focused = Some(id);
+        }
+        root.sync_focused(focused);
+
         let size = guard.terminal.size()?;
         root.set_frame(screen_points(size.width, size.height));
         let theme = Theme::resolve(&env);
+        let tick = renderer.tick();
         guard.terminal.draw(|frame| {
             cursor.set(None);
             root.render(
@@ -64,6 +71,7 @@ pub fn run(view: impl View) -> io::Result<()> {
                     focused,
                     cursor: &cursor,
                     picker: picker.as_ref(),
+                    tick,
                 },
             );
             if let Some(position) = cursor.get() {
@@ -77,7 +85,14 @@ pub fn run(view: impl View) -> io::Result<()> {
 
         dirty.set(false);
         while !dirty.get() {
-            if !event::poll(Duration::from_millis(250))? {
+            // Spinners advance on a timer; without them the loop only wakes
+            // for input or a signal-driven dirty flag.
+            let frame_ms = if renderer.animated() { 80 } else { 250 };
+            if !event::poll(Duration::from_millis(frame_ms))? {
+                if renderer.animated() {
+                    renderer.bump_tick();
+                    dirty.set(true);
+                }
                 continue;
             }
             match event::read()? {
@@ -86,27 +101,21 @@ pub fn run(view: impl View) -> io::Result<()> {
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         break 'app;
                     }
-                    KeyCode::Tab => {
+                    KeyCode::Tab | KeyCode::BackTab => {
                         focus_chain.clear();
                         root.collect_focus(&mut focus_chain);
                         if !focus_chain.is_empty() {
                             let next = focused
                                 .and_then(|id| focus_chain.iter().position(|&f| f == id))
-                                .map_or(0, |index| (index + 1) % focus_chain.len());
-                            focused = Some(focus_chain[next]);
-                        }
-                        dirty.set(true);
-                    }
-                    KeyCode::BackTab => {
-                        focus_chain.clear();
-                        root.collect_focus(&mut focus_chain);
-                        if !focus_chain.is_empty() {
-                            let prev = focused
-                                .and_then(|id| focus_chain.iter().position(|&f| f == id))
                                 .map_or(0, |index| {
-                                    (index + focus_chain.len() - 1) % focus_chain.len()
+                                    if key.code == KeyCode::Tab {
+                                        (index + 1) % focus_chain.len()
+                                    } else {
+                                        (index + focus_chain.len() - 1) % focus_chain.len()
+                                    }
                                 });
-                            focused = Some(focus_chain[prev]);
+                            focused = Some(focus_chain[next]);
+                            root.sync_focused(focused);
                         }
                         dirty.set(true);
                     }
@@ -118,15 +127,37 @@ pub fn run(view: impl View) -> io::Result<()> {
                         }
                     }
                 },
-                Event::Mouse(mouse) => {
-                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
-                        && let Some(id) = root.hit(mouse.column, mouse.row)
-                    {
-                        focused = Some(id);
-                        root.activate(id);
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(id) = root.mouse(mouse.column, mouse.row, false) {
+                            focused = Some(id);
+                            root.sync_focused(focused);
+                        }
                         dirty.set(true);
                     }
-                }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(id) = root.mouse(mouse.column, mouse.row, true) {
+                            focused = Some(id);
+                            root.sync_focused(focused);
+                        }
+                        dirty.set(true);
+                    }
+                    MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollRight
+                    | MouseEventKind::ScrollLeft => {
+                        let (dx, dy) = match mouse.kind {
+                            MouseEventKind::ScrollDown => (0, 1),
+                            MouseEventKind::ScrollUp => (0, -1),
+                            MouseEventKind::ScrollRight => (1, 0),
+                            _ => (-1, 0),
+                        };
+                        if root.scroll_at(mouse.column, mouse.row, dx, dy) {
+                            dirty.set(true);
+                        }
+                    }
+                    _ => {}
+                },
                 Event::Resize(..) => dirty.set(true),
                 _ => {}
             }

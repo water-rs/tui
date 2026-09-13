@@ -127,35 +127,34 @@ impl GpuState {
     }
 
     /// Draws the rasterized pixels (or a placeholder) into the `clip` region
-    /// of `frame`.
+    /// of the frame at signed `origin` with cell `size`.
     ///
-    /// The surface is rasterized at `frame`'s full size; `clip` only bounds
+    /// The surface is rasterized at the frame's full size; `clip` only bounds
     /// which cells are written, so a partially visible image shows a window
     /// into the full content rather than a rescaled copy. A terminal graphics
     /// protocol is used only when the whole frame is visible — Sixel and
     /// iTerm2 cannot clip mid-image.
     pub fn draw(
         &self,
-        frame: CellRect,
+        origin: (i32, i32),
+        size: (u16, u16),
         clip: CellRect,
         picker: Option<&Picker>,
         theme: &Theme,
         buf: &mut Buffer,
     ) {
+        let (fx, fy) = origin;
         let graphics =
             picker.filter(|picker| !matches!(picker.protocol_type(), ProtocolType::Halfblocks));
         let (width, height) = match graphics {
             Some(picker) => {
                 let font = picker.font_size();
                 (
-                    u32::from(frame.width).max(1) * u32::from(font.width),
-                    u32::from(frame.height).max(1) * u32::from(font.height),
+                    u32::from(size.0).max(1) * u32::from(font.width),
+                    u32::from(size.1).max(1) * u32::from(font.height),
                 )
             }
-            None => (
-                u32::from(frame.width).max(1),
-                u32::from(frame.height).max(1) * 2,
-            ),
+            None => (u32::from(size.0).max(1), u32::from(size.1).max(1) * 2),
         };
         self.rasterize(width, height);
         let raster = self.raster.borrow();
@@ -164,26 +163,29 @@ impl GpuState {
             buf.set_stringn(clip.x, clip.y, "[gpu]", 5, muted);
             return;
         }
-        if clip == frame
-            && let Some(picker) = picker
+        let frame =
+            (fx >= 0 && fy >= 0).then(|| CellRect::new(fx as u16, fy as u16, size.0, size.1));
+        if let (Some(frame), Some(picker)) = (frame, graphics)
+            && clip == frame
             && self.draw_protocol(picker, frame, buf)
         {
             return;
         }
         let raster = raster.as_ref().unwrap();
-        let cell_w = f32::from(frame.width);
-        let cell_h = f32::from(frame.height);
+        let cell_w = f32::from(size.0);
+        let cell_h = f32::from(size.1);
         let pixel = |x: u32, y: u32| -> [u8; 4] {
             let offset = ((y * raster.width + x) * 4) as usize;
             raster.rgba8[offset..offset + 4].try_into().unwrap()
         };
         for row in clip.top()..clip.bottom() {
-            let top = (f32::from(row - frame.y) * 2.0 + 0.5) / (cell_h * 2.0);
-            let bottom = (f32::from(row - frame.y) * 2.0 + 1.5) / (cell_h * 2.0);
+            let dy = i32::from(row) - fy;
+            let top = (dy as f32 * 2.0 + 0.5) / (cell_h * 2.0);
+            let bottom = (dy as f32 * 2.0 + 1.5) / (cell_h * 2.0);
             let py_top = ((top * raster.height as f32) as u32).min(raster.height - 1);
             let py_bottom = ((bottom * raster.height as f32) as u32).min(raster.height - 1);
             for col in clip.left()..clip.right() {
-                let u = (f32::from(col - frame.x) + 0.5) / cell_w;
+                let u = ((i32::from(col) - fx) as f32 + 0.5) / cell_w;
                 let px = ((u * raster.width as f32) as u32).min(raster.width - 1);
                 let under = cell_under(buf[(col, row)].bg, theme.background);
                 let [r, g, b, a] = pixel(px, py_top);

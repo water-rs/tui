@@ -15,6 +15,10 @@ waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/tex
 waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
 waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics", default-features = false, features = ["gpu"] }
 waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
+waterui-internal = { path = "/Users/lexoliu/Coding/waterui/src", default-features = false }
+waterui-form = { path = "/Users/lexoliu/Coding/waterui/components/foundation/form" }
+waterui-navigation = { path = "/Users/lexoliu/Coding/waterui/components/foundation/navigation" }
+waterui-shape = { path = "/Users/lexoliu/Coding/waterui/components/foundation/shape" }
 nami = "0.11.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"

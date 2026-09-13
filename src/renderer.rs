@@ -12,6 +12,8 @@ use std::rc::Rc;
 use nami::{Computed, Signal};
 use waterui_backend_core::dispatcher::ViewDispatcher;
 use waterui_controls::button::ButtonConfig;
+use waterui_controls::slider::SliderConfig;
+use waterui_controls::stepper::StepperConfig;
 use waterui_controls::text_field::ResolvedTextFieldConfig;
 use waterui_controls::toggle::ToggleConfig;
 use waterui_core::accessibility::{
@@ -23,19 +25,42 @@ use waterui_core::gesture::GestureObserver;
 use waterui_core::layout::{HorizontalAlignment, LayoutPriority, StretchAxis};
 use waterui_core::views::{SharedAnyViews, Views};
 use waterui_core::{AnyView, Dynamic, Environment, Metadata, Native, Retain, Str, View};
+use waterui_form::secure::SecureFieldConfig;
+use waterui_graphics::AppliedFilter;
 use waterui_graphics::color::{Color, ResolvedColor};
 use waterui_graphics::gradient_renderer::ResolvedGradient;
 use waterui_graphics::{GpuRuntime, GpuSurface};
 use waterui_icon::SystemIcon;
+use waterui_internal::background::{Background, MaterialBackground};
+use waterui_internal::border::Border;
+use waterui_internal::component::focus::Focused;
+use waterui_internal::component::progress::{ProgressConfig, ProgressStyle};
+use waterui_internal::cursor::Cursor;
+use waterui_internal::drag_drop::{Draggable, DropDestination};
+use waterui_internal::filter::Opacity;
+use waterui_internal::interaction::Hittable;
+use waterui_internal::metadata::context_menu::{ContextMenu, ResolvedContextMenu};
+use waterui_internal::metadata::secure::{
+    HighDynamicRange, Secure as SecureFlag, StandardDynamicRange,
+};
+use waterui_internal::style::{Offset, Rotation, Scale, Shadow};
 use waterui_layout::container::{FixedContainer, LazyContainer};
 use waterui_layout::divider::Divider;
+use waterui_layout::safe_area::IgnoreSafeArea;
+use waterui_layout::scroll::ScrollView;
 use waterui_layout::spacer::{Spacer, SpacerLayout};
 use waterui_layout::stack::Axis;
+use waterui_navigation::{
+    NavigationLinkHint, NavigationTransitionDestination, NavigationTransitionSource,
+    NavigationView, TabsLayout,
+};
+use waterui_shape::ClipShape;
 use waterui_text::styled::StyledStr;
 use waterui_text::text::TextConfig;
 
 use crate::gpu::GpuState;
-use crate::node::{FieldState, Kind, LazyState, Node};
+use crate::node::{FieldState, Kind, LazyState, Node, ScrollState, SecureState, TabEntry};
+use crate::units::{PT_PER_COL, PT_PER_ROW};
 
 /// Lazy `GpuRuntime` initialization: `Untried` until the first `GpuSurface`
 /// is dispatched, then either `Ready` or `Unavailable` for the rest of the
@@ -50,8 +75,14 @@ enum GpuInit {
 pub struct TuiState {
     /// Set by signal watchers; the event loop redraws when raised.
     pub dirty: Rc<Cell<bool>>,
+    /// Animation frame counter; the event loop advances it while `animated`
+    /// holds so indeterminate progress spinners move.
+    pub tick: Cell<u64>,
+    /// Raised when at least one animated node (a `Loading` progress) exists.
+    pub animated: Cell<bool>,
     next_focus: Cell<u32>,
     appear: Vec<(LifeCycleHook, Environment)>,
+    focus_requests: Rc<RefCell<Vec<u32>>>,
     gpu: RefCell<GpuInit>,
 }
 
@@ -59,8 +90,11 @@ impl Default for TuiState {
     fn default() -> Self {
         Self {
             dirty: Rc::new(Cell::new(true)),
+            tick: Cell::new(0),
+            animated: Cell::new(false),
             next_focus: Cell::new(0),
             appear: Vec::new(),
+            focus_requests: Rc::new(RefCell::new(Vec::new())),
             gpu: RefCell::new(GpuInit::Untried),
         }
     }
@@ -83,6 +117,11 @@ impl TuiState {
     /// Drains pending `Appear` lifecycle hooks.
     pub fn take_appear_hooks(&mut self) -> Vec<(LifeCycleHook, Environment)> {
         core::mem::take(&mut self.appear)
+    }
+
+    /// Drains focus ids queued by `.focused(true)` bindings.
+    pub fn take_focus_requests(&mut self) -> Vec<u32> {
+        core::mem::take(&mut *self.focus_requests.borrow_mut())
     }
 
     /// Returns the shared GPU runtime, initializing it on first use.
@@ -180,6 +219,27 @@ impl TuiRenderer {
     /// Dispatches a view into the root node.
     pub fn dispatch<V: View>(&mut self, view: V, env: &Environment) -> Node {
         self.dispatcher.dispatch(view, env, self.ctx())
+    }
+
+    /// Drains focus ids queued by `.focused(true)` bindings.
+    pub fn take_focus_requests(&mut self) -> Vec<u32> {
+        self.dispatcher.state_mut().take_focus_requests()
+    }
+
+    /// Whether animated nodes (loading spinners) exist.
+    pub fn animated(&self) -> bool {
+        self.dispatcher.state().animated.get()
+    }
+
+    /// The current animation frame counter.
+    pub fn tick(&self) -> u64 {
+        self.dispatcher.state().tick.get()
+    }
+
+    /// Advances the animation frame counter.
+    pub fn bump_tick(&self) {
+        let tick = &self.dispatcher.state().tick;
+        tick.set(tick.get() + 1);
     }
 
     fn register_handlers(&mut self) {
@@ -350,6 +410,187 @@ impl TuiRenderer {
             node
         });
 
+        d.register::<Native<SecureFieldConfig>>(|state, _ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let config = view.into_inner();
+            let label = config.label.accessibility_label();
+            let cursor = config.value.get().expose().chars().count();
+            let mut node = Node::new(
+                Kind::Secure(SecureState {
+                    label: label.clone(),
+                    value: config.value.clone(),
+                    cursor: Cell::new(cursor),
+                }),
+                env,
+            );
+            node.focus = Some(state.next_focus());
+            node.stretch = stretch;
+            state.watch(&config.value, &mut node);
+            state.watch(&label, &mut node);
+            node
+        });
+
+        d.register::<Native<SliderConfig>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let config = view.into_inner();
+            let mut node = Node::new(
+                Kind::Slider {
+                    value: config.value.clone(),
+                    range: config.range.clone(),
+                    track: Cell::new((0, 0)),
+                },
+                env,
+            );
+            node.children.push(ctx.dispatch(config.label, env));
+            node.children
+                .push(ctx.dispatch(config.min_value_label, env));
+            node.children
+                .push(ctx.dispatch(config.max_value_label, env));
+            node.focus = Some(state.next_focus());
+            node.stretch = stretch;
+            state.watch(&config.value, &mut node);
+            node
+        });
+
+        d.register::<Native<StepperConfig>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let config = view.into_inner();
+            let mut node = Node::new(
+                Kind::Stepper {
+                    value: config.value.clone(),
+                    step: config.step.clone(),
+                    range: config.range.clone(),
+                    formatter: config.value_formatter.clone(),
+                },
+                env,
+            );
+            node.children.push(ctx.dispatch(config.label, env));
+            node.focus = Some(state.next_focus());
+            node.stretch = stretch;
+            state.watch(&config.value, &mut node);
+            state.watch(&config.step, &mut node);
+            if let Some(formatter) = &config.value_formatter {
+                state.watch(formatter, &mut node);
+            }
+            node
+        });
+
+        d.register::<Native<ProgressConfig>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let config = view.into_inner();
+            if matches!(config.style, ProgressStyle::Loading) {
+                state.animated.set(true);
+            }
+            let mut node = Node::new(
+                Kind::Progress {
+                    value: config.value.clone(),
+                    style: config.style,
+                    bar: Cell::new((0, 0)),
+                },
+                env,
+            );
+            node.children.push(ctx.dispatch(config.label, env));
+            node.children.push(ctx.dispatch(config.value_label, env));
+            node.stretch = stretch;
+            state.watch(&config.value, &mut node);
+            node
+        });
+
+        // ---- Containers ---------------------------------------------------
+
+        d.register::<Native<ScrollView>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let (axis, content, controller) = view.into_inner().into_inner();
+            let requested = Rc::new(Cell::new(None));
+            if let Some(controller) = controller {
+                let generation = controller.generation();
+                let target = controller.target();
+                let slot = requested.clone();
+                let dirty = state.dirty.clone();
+                let guard = generation.watch(move |_| {
+                    let point = target.get();
+                    slot.set(Some((
+                        (point.x / PT_PER_COL).round() as i32,
+                        (point.y / PT_PER_ROW).round() as i32,
+                    )));
+                    dirty.set(true);
+                });
+                // The guard is attached to the node below.
+                let mut node = Node::new(
+                    Kind::Scroll(ScrollState {
+                        axis,
+                        offset: Cell::new((0, 0)),
+                        extent: Cell::new((0, 0)),
+                        requested,
+                    }),
+                    env,
+                );
+                node.children.push(ctx.dispatch(content, env));
+                node.focus = Some(state.next_focus());
+                node.stretch = stretch;
+                node.guards.push(Box::new(guard));
+                return node;
+            }
+            let mut node = Node::new(
+                Kind::Scroll(ScrollState {
+                    axis,
+                    offset: Cell::new((0, 0)),
+                    extent: Cell::new((0, 0)),
+                    requested,
+                }),
+                env,
+            );
+            node.children.push(ctx.dispatch(content, env));
+            node.focus = Some(state.next_focus());
+            node.stretch = stretch;
+            node
+        });
+
+        d.register::<Native<TabsLayout>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let layout = view.into_inner();
+            let mut entries = Vec::with_capacity(layout.tabs.len());
+            let mut labels = Vec::with_capacity(layout.tabs.len());
+            let mut contents = Vec::with_capacity(layout.tabs.len());
+            for tab in layout.tabs {
+                entries.push(TabEntry {
+                    id: tab.id,
+                    enabled: tab.enabled.clone(),
+                    badge: tab.badge.clone(),
+                });
+                labels.push(ctx.dispatch(tab.label, env));
+                contents.push(ctx.dispatch(tab.content.build(), env));
+            }
+            let mut node = Node::new(
+                Kind::Tabs {
+                    selection: layout.selection.clone(),
+                    tabs: entries,
+                },
+                env,
+            );
+            node.children = labels.into_iter().chain(contents).collect();
+            node.focus = Some(state.next_focus());
+            node.stretch = stretch;
+            state.watch(&layout.selection, &mut node);
+            node
+        });
+
+        d.register::<Native<NavigationView>>(|state, ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let view = view.into_inner();
+            let mut node = Node::new(
+                Kind::NavBar {
+                    hidden: view.bar.hidden.clone(),
+                },
+                env,
+            );
+            node.children.push(ctx.dispatch(view.bar.title, env));
+            node.children.push(ctx.dispatch(view.content, env));
+            node.stretch = stretch;
+            state.watch(&view.bar.hidden, &mut node);
+            node
+        });
+
         // ---- Containers ---------------------------------------------------
 
         d.register::<Native<FixedContainer>>(|_state, ctx, view, env| {
@@ -438,8 +679,43 @@ impl TuiRenderer {
             ctx.dispatch(metadata.content, env)
         });
 
+        // `.focused(binding)` — two-way focus: the event loop writes the
+        // binding when the subtree gains/loses focus (`sync_focused`), and a
+        // `true` write queues a request to move focus to its first focusable
+        // descendant.
+        d.register::<Metadata<Focused>>(|state, ctx, metadata, env| {
+            let mut node = ctx.dispatch(metadata.content, env);
+            let binding = metadata.value.0;
+            let mut ids = Vec::new();
+            node.collect_focus(&mut ids);
+            if let Some(&id) = ids.first() {
+                let queue = state.focus_requests.clone();
+                let dirty = state.dirty.clone();
+                node.guards.push(Box::new(binding.watch(move |ctx| {
+                    if *ctx.value() {
+                        queue.borrow_mut().push(id);
+                        dirty.set(true);
+                    }
+                })));
+            }
+            node.focus_signal = Some(binding);
+            node
+        });
+
+        // `.offset(x, y)` — a visual translation; applied in `set_frame`.
+        d.register::<Metadata<Offset>>(|_state, ctx, metadata, env| {
+            let node = ctx.dispatch(metadata.content, env);
+            node.offset
+                .set((metadata.value.x.get(), metadata.value.y.get()));
+            node
+        });
+
         // Accessibility metadata is recorded semantics: a terminal has no
-        // screen reader, so it passes straight through to the content.
+        // screen reader, so it passes straight through to the content. The
+        // remaining metadata keys are visual or platform semantics with no
+        // terminal realization — a cell grid has no shadows, rotations, drag
+        // sessions, context menus, or HDR — so they are caught and ignored
+        // rather than panicking inside `Metadata::body`.
         macro_rules! passthrough {
             ($($ty:ty),* $(,)?) => {
                 $(d.register::<Metadata<$ty>>(|_state, ctx, metadata, env| {
@@ -458,6 +734,31 @@ impl TuiRenderer {
             AccessibilityStateSignal,
             OnEvent,
             GestureObserver,
+            // Visual effects without a cell-grid realization.
+            Opacity,
+            Rotation,
+            Scale,
+            Shadow,
+            AppliedFilter,
+            ClipShape,
+            Background,
+            MaterialBackground,
+            Border,
+            HighDynamicRange,
+            StandardDynamicRange,
+            // Interaction semantics a terminal cannot express.
+            Cursor,
+            Draggable,
+            DropDestination,
+            Hittable,
+            ContextMenu,
+            ResolvedContextMenu,
+            SecureFlag,
+            IgnoreSafeArea,
+            // Navigation chrome wiring.
+            NavigationLinkHint,
+            NavigationTransitionDestination,
+            NavigationTransitionSource,
         );
 
         // `IgnorableMetadata<T>` unwraps itself in `body`, so it never needs a

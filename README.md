@@ -14,12 +14,22 @@ Experiment — not integrated into the WaterUI CLI, not published.
 
 Supported: `Text`/`StyledStr` (styled spans, alignment, `line_limit`), all
 `Layout`-driven containers (`vstack`, `hstack`, `padding`, `frame`, `spacer`,
-scroll-less `LazyContainer`), `Button`, `Toggle`, `TextField`, `Divider`,
-`Color` fills, `Gradient` (linear/radial/angular), `GpuSurface` content
-(images, mesh gradients, shader surfaces),
-`Metadata<Environment>`/`LayoutPriority`/`Retain`/`LifeCycleHook(Appear)`,
-`Dynamic` subtree rebuilds, keyboard focus (`Tab`/`Shift-Tab`,
-`Enter`/`Space`), mouse click, terminal resize, theme color tokens.
+scroll-less `LazyContainer`), `Button`, `Toggle`, `TextField`, `SecureField`,
+`Slider`, `Stepper`, `Progress` (linear `█░` bar, `◔◑◕●` circular, braille
+spinner for `loading()`), `ScrollView` (viewport clipping, `┃` scrollbar,
+wheel and `↑`/`↓`/`PageUp`/`PageDown`/`Home`/`End`, `ScrollController`),
+`Tabs` (label bar, `←`/`→` switching, per-tab navigation), `NavigationView`
+(title bar + rule), `Divider`, `Color` fills, `Gradient`
+(linear/radial/angular), `GpuSurface` content (images, mesh gradients, shader
+surfaces), `Metadata<Environment>`/`LayoutPriority`/`Retain`/
+`LifeCycleHook(Appear)`, `Focused` two-way focus binding, `Offset` visual
+translation, `Dynamic` subtree rebuilds, keyboard focus (`Tab`/`Shift-Tab`,
+`Enter`/`Space`), mouse click/drag/wheel, terminal resize, theme color tokens.
+
+All other `MetadataKey`s are registered as pass-through so common modifiers
+(`.opacity()`, `.shadow()`, `.rotation()`, `.context_menu()`, safe-area,
+navigation hints, HDR flags, drag/drop, cursor, secure-flag) dispatch without
+panicking; they simply have no visual realization on a cell grid.
 
 **Gradients** are sampled per cell in the gradient's normalized space and
 drawn as `▀` half blocks: the foreground carries the top half's color, the
@@ -67,8 +77,9 @@ fn main() -> std::io::Result<()> {
 
 For embedding, drive `TuiRenderer` + `Node` directly: `dispatch` a view into a
 root `Node`, call `Node::set_frame` per resize, `Node::render` into a ratatui
-`Buffer`, forward key/mouse events to `Node::handle_key`/`Node::hit`, and
-watch `TuiRenderer::dirty()` for redraw requests.
+`Buffer`, forward key/mouse events to `Node::handle_key`/`Node::mouse`/
+`Node::scroll_at`, drain `TuiRenderer::take_focus_requests` and feed
+`Node::sync_focused`, and watch `TuiRenderer::dirty()` for redraw requests.
 
 ## Layout contract
 

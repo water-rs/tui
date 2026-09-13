@@ -59,6 +59,9 @@ impl Fixture {
     }
 
     fn render_buf(&mut self, cols: u16, rows: u16) -> Buffer {
+        // The app lays out every frame; mirror that so reactive frame changes
+        // (tab switches, scroll extents) are reflected in tests.
+        self.layout(cols, rows);
         let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
         self.root.render(
             &mut buf,
@@ -68,6 +71,7 @@ impl Fixture {
                 focused: None,
                 cursor: &self.cursor,
                 picker: None,
+                tick: 0,
             },
         );
         buf
@@ -197,6 +201,7 @@ fn styled_str_maps_bold_and_color() {
             focused: None,
             cursor: &fixture.cursor,
             picker: None,
+            tick: 0,
         },
     );
     let cell = buf.cell((0, 0)).unwrap();
@@ -266,8 +271,193 @@ fn hit_testing_finds_focusable() {
             .hit(0, button_frame.y + button_frame.height)
             .is_none()
     );
-    assert!(fixture.root.activate(chain[0]));
+    // `mouse` performs hit-testing + activation in one step.
+    assert_eq!(
+        fixture
+            .root
+            .mouse(button_frame.x + 1, button_frame.y, false),
+        Some(chain[0])
+    );
     assert_eq!(counter.get(), 1);
+}
+
+#[test]
+fn slider_arrows_and_track_click() {
+    use waterui_controls::slider::slider;
+    let value = binding(0.5f64);
+    let view = slider("Vol", &value);
+    let mut fixture = Fixture::new(view, 40, 3);
+
+    let out = fixture.draw(40, 3);
+    assert!(out.contains('─') && out.contains('●'), "got:\n{out}");
+
+    let chain = fixture.focus_chain();
+    assert!(fixture.press(chain[0], KeyCode::Right));
+    assert!((value.get() - 0.55).abs() < 1e-9, "got {}", value.get());
+    assert!(fixture.press(chain[0], KeyCode::Home));
+    assert_eq!(value.get(), 0.0);
+    assert!(fixture.press(chain[0], KeyCode::End));
+    assert_eq!(value.get(), 1.0);
+
+    // Click at the far right of the track sets ~1.0.
+    let frame = fixture.root.frame.get();
+    fixture
+        .root
+        .mouse(frame.x + frame.width - 1, frame.y, false);
+    assert!(value.get() > 0.9, "got {}", value.get());
+}
+
+#[test]
+fn stepper_increments_with_keys_and_clicks() {
+    use waterui_controls::stepper::stepper;
+    let value = binding(0i32);
+    let view = stepper("Qty", &value).range(0..=9);
+    let mut fixture = Fixture::new(view, 30, 3);
+
+    let out = fixture.draw(30, 3);
+    assert!(out.contains("[-]") && out.contains("[+]"), "got:\n{out}");
+
+    let chain = fixture.focus_chain();
+    assert!(fixture.press(chain[0], KeyCode::Right));
+    assert_eq!(value.get(), 1);
+    // Click on the `[+]` region (rightmost 3 cells of the row).
+    let frame = fixture.root.frame.get();
+    fixture
+        .root
+        .mouse(frame.x + frame.width - 1, frame.y, false);
+    assert_eq!(value.get(), 2);
+    fixture
+        .root
+        .mouse(frame.x + frame.width - 9, frame.y, false);
+    assert_eq!(value.get(), 1, "click on [-] should decrement");
+}
+
+#[test]
+fn progress_renders_linear_circular_and_loading() {
+    use waterui_internal::component::progress::{loading, progress};
+
+    let mut fixture = Fixture::new(progress(0.5), 30, 2);
+    let out = fixture.draw(30, 2);
+    assert!(out.contains('█') && out.contains('░'), "got:\n{out}");
+
+    let mut fixture = Fixture::new(progress(1.0).circular(), 10, 2);
+    let out = fixture.draw(10, 2);
+    assert!(out.contains('●'), "got:\n{out}");
+
+    let mut fixture = Fixture::new(loading(), 10, 2);
+    let buf = fixture.render_buf(10, 2);
+    let first = buf.cell((0, 0)).unwrap().symbol().chars().next().unwrap();
+    assert!(
+        ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'].contains(&first),
+        "expected spinner glyph, got {first:?}"
+    );
+    assert!(fixture.renderer.animated(), "loading should flag animation");
+}
+
+#[test]
+fn secure_field_masks_and_edits() {
+    use waterui_form::secure::{Secure, secure};
+    let value = binding(Secure::new(String::new()));
+    let view = secure("Pass", &value);
+    let mut fixture = Fixture::new(view, 40, 3);
+
+    let chain = fixture.focus_chain();
+    for c in ['h', 'i'] {
+        assert!(fixture.press(chain[0], KeyCode::Char(c)));
+    }
+    assert_eq!(value.get().expose(), "hi");
+
+    let out = fixture.draw(40, 3);
+    assert!(out.contains("Pass: ••"), "got:\n{out}");
+    assert!(!out.contains("hi"), "secret must not render:\n{out}");
+}
+
+#[test]
+fn scroll_view_clips_and_wheel_scrolls() {
+    use waterui_layout::scroll::scroll;
+    let rows: Vec<_> = (0..10)
+        .map(|i| text(Str::from(format!("row{i}"))))
+        .collect();
+    let view = scroll(vstack(rows).spacing(0.0));
+    let mut fixture = Fixture::new(view, 20, 4);
+
+    let out = fixture.draw(20, 4);
+    assert!(out.contains("row0") && out.contains("row3"), "got:\n{out}");
+    assert!(!out.contains("row9"), "row9 should be clipped:\n{out}");
+    // Scrollbar on the right edge.
+    let line: String = (0..4)
+        .map(|y| {
+            fixture
+                .render_buf(20, 4)
+                .cell((19, y))
+                .unwrap()
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        line.contains('┃') || line.contains('│'),
+        "scrollbar: {line}"
+    );
+
+    // Wheel down shifts content up.
+    assert!(fixture.root.scroll_at(5, 1, 0, 2));
+    let out = fixture.draw(20, 4);
+    assert!(out.contains("row2"), "after scroll:\n{out}");
+    assert!(!out.contains("row0"), "row0 should be scrolled out:\n{out}");
+}
+
+#[test]
+fn tabs_render_labels_and_switch() {
+    use waterui_navigation::{NavigationView, Tab, Tabs};
+    let selection = binding(0i32);
+    let view = Tabs::new(
+        &selection,
+        vec![
+            Tab::new(0, "One", || NavigationView::new("", text("first-page"))),
+            Tab::new(1, "Two", || NavigationView::new("", text("second-page"))),
+        ],
+    );
+    let mut fixture = Fixture::new(view, 40, 6);
+
+    let out = fixture.draw(40, 6);
+    assert!(out.contains("One") && out.contains("Two"), "got:\n{out}");
+    assert!(out.contains("first-page"), "got:\n{out}");
+    assert!(!out.contains("second-page"), "got:\n{out}");
+
+    let chain = fixture.focus_chain();
+    assert!(fixture.press(chain[0], KeyCode::Right));
+    assert_eq!(selection.get(), 1);
+    let out = fixture.draw(40, 6);
+    assert!(out.contains("second-page"), "got:\n{out}");
+    assert!(!out.contains("first-page"), "got:\n{out}");
+}
+
+#[test]
+fn offset_metadata_shifts_rendering() {
+    use waterui_core::Metadata;
+    use waterui_internal::style::Offset;
+    let view = Metadata::new(text("moved"), Offset::new(3.0, 8.0));
+    let mut fixture = Fixture::new(view, 20, 4);
+    let out = fixture.draw(20, 4);
+    let line = out.lines().nth(1).unwrap();
+    assert!(line.starts_with("   moved"), "got:\n{out}");
+}
+
+#[test]
+fn focused_binding_requests_focus() {
+    use waterui_controls::field;
+    use waterui_core::Metadata;
+    use waterui_internal::component::focus::Focused;
+    let text_value = binding(Str::from_static(""));
+    let focused = binding(false);
+    let view = Metadata::new(field("Name", &text_value), Focused(focused.clone()));
+    let mut fixture = Fixture::new(view, 40, 3);
+
+    focused.set(true);
+    let requests = fixture.renderer.take_focus_requests();
+    let chain = fixture.focus_chain();
+    assert_eq!(requests, vec![chain[0]], "should request the field's id");
 }
 
 fn srgb(r: u8, g: u8, b: u8) -> waterui_graphics::color::ResolvedColor {

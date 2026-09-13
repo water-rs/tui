@@ -32,6 +32,23 @@ const fn clamp_cell(v: f32) -> u16 {
     }
 }
 
+/// Rounds a point width to whole terminal columns.
+#[must_use]
+pub(crate) fn cols_for(width: f32) -> u16 {
+    clamp_cell((width / PT_PER_COL).round())
+}
+
+/// Rounds a point height to whole terminal rows (positive heights give at
+/// least one row, matching `to_cells`).
+#[must_use]
+pub(crate) fn rows_for(height: f32) -> u16 {
+    if height <= 0.0 {
+        0
+    } else {
+        clamp_cell((height / PT_PER_ROW).round().max(1.0))
+    }
+}
+
 /// Snaps a point-space rect to whole terminal cells.
 ///
 /// Columns round to the nearest boundary. For rows the top edge is floored and

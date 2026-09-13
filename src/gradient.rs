@@ -70,26 +70,30 @@ fn stop_color(gradient: &ResolvedGradient, t: f32) -> ResolvedColor {
     }
 }
 
-/// Paints `gradient` into the `clip` region of `frame`, compositing each
-/// half-cell sample over the color already underneath.
+/// Paints `gradient` into the `clip` region of the frame at signed `origin`
+/// with cell `size`, compositing each half-cell sample over the color already
+/// underneath.
 ///
-/// `frame` is the node's full cell frame; `clip` is the part that intersects
-/// the buffer. Sampling coordinates stay relative to `frame` so a partially
-/// visible gradient does not shift its colors.
+/// `origin` may be negative (scrolled content); `clip` is the part that
+/// intersects the buffer. Sampling coordinates stay relative to the full
+/// frame so a partially visible gradient does not shift its colors.
 pub fn draw_gradient(
     gradient: &ResolvedGradient,
-    frame: CellRect,
+    origin: (i32, i32),
+    size: (u16, u16),
     clip: CellRect,
     theme_bg: Color,
     buf: &mut Buffer,
 ) {
-    let width = f32::from(frame.width);
-    let height = f32::from(frame.height);
+    let (fx, fy) = origin;
+    let width = f32::from(size.0);
+    let height = f32::from(size.1);
     for row in clip.top()..clip.bottom() {
-        let top = (f32::from(row - frame.y) * 2.0 + 0.5) / (height * 2.0);
-        let bottom = (f32::from(row - frame.y) * 2.0 + 1.5) / (height * 2.0);
+        let dy = i32::from(row) - fy;
+        let top = (dy as f32 * 2.0 + 0.5) / (height * 2.0);
+        let bottom = (dy as f32 * 2.0 + 1.5) / (height * 2.0);
         for col in clip.left()..clip.right() {
-            let u = (f32::from(col - frame.x) + 0.5) / width;
+            let u = ((i32::from(col) - fx) as f32 + 0.5) / width;
             let under = cell_under(buf[(col, row)].bg, theme_bg);
             let style = Style::default()
                 .fg(composite_over(sample(gradient, u, top), under))
