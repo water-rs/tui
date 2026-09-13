@@ -13,12 +13,14 @@ waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core", d
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
 waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
 waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
-waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics", default-features = false }
+waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics", default-features = false, features = ["gpu"] }
 waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
 nami = "0.11.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 unicode-width = "0.2"
+pollster = "1.0"
+tracing = "0.1"
 
 [dev-dependencies]
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }

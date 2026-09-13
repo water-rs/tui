@@ -15,14 +15,26 @@ Experiment — not integrated into the WaterUI CLI, not published.
 Supported: `Text`/`StyledStr` (styled spans, alignment, `line_limit`), all
 `Layout`-driven containers (`vstack`, `hstack`, `padding`, `frame`, `spacer`,
 scroll-less `LazyContainer`), `Button`, `Toggle`, `TextField`, `Divider`,
-`Color` fills, `Metadata<Environment>`/`LayoutPriority`/`Retain`/
-`LifeCycleHook(Appear)`, `Dynamic` subtree rebuilds, keyboard focus
-(`Tab`/`Shift-Tab`, `Enter`/`Space`), mouse click, terminal resize, theme
-color tokens.
+`Color` fills, `Gradient` (linear/radial/angular), `GpuSurface` content
+(images, mesh gradients, shader surfaces),
+`Metadata<Environment>`/`LayoutPriority`/`Retain`/`LifeCycleHook(Appear)`,
+`Dynamic` subtree rebuilds, keyboard focus (`Tab`/`Shift-Tab`,
+`Enter`/`Space`), mouse click, terminal resize, theme color tokens.
 
-Not supported (by design): GPU surfaces, video, maps, web views, images,
-canvas — a terminal has no such primitives. `SystemIcon` renders as a
-`[name]` placeholder since no OS symbol catalog exists on a terminal.
+**Gradients** are sampled per cell in the gradient's normalized space and
+drawn as `▀` half blocks: the foreground carries the top half's color, the
+background the bottom half's, giving two gradient rows per terminal row.
+
+**GPU surfaces** (`Image`, `Gradient::mesh`, `ShaderSurface`, any `GpuView`)
+are rendered once into an offscreen wgpu texture at the node's cell size and
+read back as `RGBA8`, then mapped onto `▀` cells — two source pixel rows per
+terminal row, alpha-composited over the cell underneath. Rasterization is a
+snapshot: animated `GpuView`s show their first frame. Hosts without a usable
+GPU adapter draw a `[gpu]` placeholder instead of panicking.
+
+Not supported (by design): video, maps, web views, canvas — a terminal has no
+such primitives. `SystemIcon` renders as a `[name]` placeholder since no OS
+symbol catalog exists on a terminal.
 
 ## Try it
 

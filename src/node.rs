@@ -26,8 +26,11 @@ use waterui_core::layout::{
 use waterui_core::views::SharedAnyViews;
 use waterui_core::{AnyView, Environment};
 use waterui_graphics::color::ResolvedColor;
+use waterui_graphics::gradient_renderer::ResolvedGradient;
 use waterui_text::styled::StyledStr;
 
+use crate::gpu::GpuState;
+use crate::gradient::draw_gradient;
 use crate::style::{Theme, chunk_style, tui_color};
 use crate::units::{LINE_HEIGHT, PT_PER_ROW, to_cells};
 
@@ -109,6 +112,11 @@ pub enum Kind {
     Dynamic(Rc<RefCell<Node>>),
     /// Paints `children[0]`'s frame with a background color underneath.
     Background(Computed<ResolvedColor>),
+    /// A linear/radial/angular gradient filling its frame.
+    Gradient(ResolvedGradient),
+    /// GPU-rendered content (images, mesh gradients, shader surfaces)
+    /// rasterized into the cell grid.
+    Gpu(GpuState),
 }
 
 /// A dispatched view: layout leaf, drawable region, and event target.
@@ -211,7 +219,12 @@ impl Node {
 
     /// Draws the node into the buffer. Children draw after their chrome.
     pub fn render(&self, buf: &mut Buffer, ctx: &DrawCtx) {
-        let area = self.frame.get();
+        // Content can legitimately overflow the screen (a stack taller than
+        // the window); cell access panics out of bounds, so clip first.
+        // Sampled paints (gradient/GPU) still need the unclipped frame to
+        // keep their coordinates anchored to the full node, not the window.
+        let frame = self.frame.get();
+        let area = frame.intersection(buf.area);
         if area.is_empty() {
             return;
         }
@@ -284,6 +297,12 @@ impl Node {
             Kind::Empty | Kind::Container(_) | Kind::Lazy(_) | Kind::Dynamic(_) => {}
             Kind::Background(color) => {
                 buf.set_style(area, Style::default().bg(tui_color(color.get())));
+            }
+            Kind::Gradient(gradient) => {
+                draw_gradient(gradient, frame, area, ctx.theme.background, buf);
+            }
+            Kind::Gpu(state) => {
+                state.draw(frame, area, ctx.theme, buf);
             }
         }
 
@@ -473,7 +492,9 @@ impl SubView for Node {
                     Size::new(0.0, LINE_HEIGHT)
                 }
             }
-            Kind::Fill(_) => Size::new(proposal.width_or(0.0), proposal.height_or(0.0)),
+            Kind::Fill(_) | Kind::Gradient(_) | Kind::Gpu(_) => {
+                Size::new(proposal.width_or(0.0), proposal.height_or(0.0))
+            }
             Kind::Container(layout) => {
                 return measure_layout(
                     layout.as_ref(),

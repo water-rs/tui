@@ -18,6 +18,49 @@ pub fn tui_color(color: ResolvedColor) -> Color {
     Color::Rgb(channel(srgb.red), channel(srgb.green), channel(srgb.blue))
 }
 
+/// Composites `src` (linear space + opacity) over an existing cell color.
+///
+/// Terminals cannot blend colors; sampled paints such as gradients and image
+/// pixels are approximated by mixing in sRGB space over the color already
+/// underneath the cell.
+#[must_use]
+pub fn composite_over(src: ResolvedColor, under: Color) -> Color {
+    let srgb = src.to_srgb_with_headroom();
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    composite_rgb8(
+        channel(srgb.red),
+        channel(srgb.green),
+        channel(srgb.blue),
+        (src.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+        under,
+    )
+}
+
+/// Composites an sRGB `rgba8` source over an existing cell color.
+#[must_use]
+pub fn composite_rgb8(r: u8, g: u8, b: u8, a: u8, under: Color) -> Color {
+    if a == u8::MAX {
+        return Color::Rgb(r, g, b);
+    }
+    let Color::Rgb(ur, ug, ub) = under else {
+        return Color::Rgb(r, g, b);
+    };
+    let alpha = f32::from(a) / 255.0;
+    let mix = |s: u8, d: u8| (f32::from(s) * alpha + f32::from(d) * (1.0 - alpha)).round() as u8;
+    Color::Rgb(mix(r, ur), mix(g, ug), mix(b, ub))
+}
+
+/// The color a cell shows through its background slot: its `bg`, falling back
+/// to the theme background when the cell carries `Color::Reset`.
+#[must_use]
+pub fn cell_under(cell_bg: Color, theme_bg: Color) -> Color {
+    match (cell_bg, theme_bg) {
+        (Color::Reset, Color::Reset) => Color::Black,
+        (Color::Reset, theme) => theme,
+        (cell, _) => cell,
+    }
+}
+
 /// The theme slots a frame needs, resolved once per draw.
 ///
 /// The underlying values are `Computed`, so a theme that swaps its signals

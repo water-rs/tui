@@ -14,6 +14,12 @@
 //!   and any other `Layout`-driven container work unchanged
 //! - `Button`, `Toggle`, `TextField`
 //! - `Divider`, `Color`/`ResolvedColor` fills
+//! - `Gradient` — linear/radial/angular gradients are sampled per cell into
+//!   `▀` half-block pairs (two gradient rows per terminal row); mesh
+//!   gradients reach the backend as `GpuSurface` like every other GPU view
+//! - `GpuSurface` — images and other `GpuView` content are rasterized once
+//!   through an offscreen wgpu pass, then resampled into half-block cells;
+//!   hosts without a GPU adapter draw a `[gpu]` placeholder
 //! - `Metadata<Environment>` / `LayoutPriority` / `Retain` / `LifeCycleHook`
 //!   and the accessibility metadata keys (recorded, not exposed)
 //! - `Dynamic` subtrees are re-dispatched in place when their signal updates
@@ -30,6 +36,8 @@
 //! directly.
 
 mod app;
+pub mod gpu;
+pub mod gradient;
 pub mod node;
 mod renderer;
 pub mod style;

@@ -24,6 +24,8 @@ use waterui_core::layout::{HorizontalAlignment, LayoutPriority, StretchAxis};
 use waterui_core::views::{SharedAnyViews, Views};
 use waterui_core::{AnyView, Dynamic, Environment, Metadata, Native, Retain, Str, View};
 use waterui_graphics::color::{Color, ResolvedColor};
+use waterui_graphics::gradient_renderer::ResolvedGradient;
+use waterui_graphics::{GpuRuntime, GpuSurface};
 use waterui_icon::SystemIcon;
 use waterui_layout::container::{FixedContainer, LazyContainer};
 use waterui_layout::divider::Divider;
@@ -32,7 +34,17 @@ use waterui_layout::stack::Axis;
 use waterui_text::styled::StyledStr;
 use waterui_text::text::TextConfig;
 
+use crate::gpu::GpuState;
 use crate::node::{FieldState, Kind, LazyState, Node};
+
+/// Lazy `GpuRuntime` initialization: `Untried` until the first `GpuSurface`
+/// is dispatched, then either `Ready` or `Unavailable` for the rest of the
+/// renderer's life.
+enum GpuInit {
+    Untried,
+    Ready(GpuRuntime),
+    Unavailable,
+}
 
 /// State carried by the dispatcher — reachable from every handler.
 pub struct TuiState {
@@ -40,6 +52,7 @@ pub struct TuiState {
     pub dirty: Rc<Cell<bool>>,
     next_focus: Cell<u32>,
     appear: Vec<(LifeCycleHook, Environment)>,
+    gpu: RefCell<GpuInit>,
 }
 
 impl Default for TuiState {
@@ -48,6 +61,7 @@ impl Default for TuiState {
             dirty: Rc::new(Cell::new(true)),
             next_focus: Cell::new(0),
             appear: Vec::new(),
+            gpu: RefCell::new(GpuInit::Untried),
         }
     }
 }
@@ -69,6 +83,29 @@ impl TuiState {
     /// Drains pending `Appear` lifecycle hooks.
     pub fn take_appear_hooks(&mut self) -> Vec<(LifeCycleHook, Environment)> {
         core::mem::take(&mut self.appear)
+    }
+
+    /// Returns the shared GPU runtime, initializing it on first use.
+    ///
+    /// `None` means no usable GPU adapter exists on this host; GPU-backed
+    /// nodes then draw a placeholder instead of panicking.
+    fn gpu(&self) -> Option<GpuRuntime> {
+        {
+            let mut init = self.gpu.borrow_mut();
+            if matches!(*init, GpuInit::Untried) {
+                *init = match pollster::block_on(GpuRuntime::new()) {
+                    Ok(runtime) => GpuInit::Ready(runtime),
+                    Err(error) => {
+                        tracing::warn!("GPU runtime unavailable: {error}");
+                        GpuInit::Unavailable
+                    }
+                };
+            }
+        }
+        match &*self.gpu.borrow() {
+            GpuInit::Ready(runtime) => Some(runtime.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -131,6 +168,13 @@ impl TuiRenderer {
     /// Drains `Appear` lifecycle hooks collected during the last dispatch.
     pub fn take_appear_hooks(&mut self) -> Vec<(LifeCycleHook, Environment)> {
         self.dispatcher.state_mut().take_appear_hooks()
+    }
+
+    /// Whether this host can rasterize `GpuSurface` content (images, mesh
+    /// gradients, shader surfaces). `false` means those nodes draw a
+    /// placeholder.
+    pub fn gpu_available(&self) -> bool {
+        self.dispatcher.state().gpu().is_some()
     }
 
     /// Dispatches a view into the root node.
@@ -211,6 +255,23 @@ impl TuiRenderer {
         d.register::<Native<ResolvedColor>>(|_state, _ctx, view, env| {
             let stretch = view.stretch_axis();
             let mut node = Node::new(Kind::Fill(Computed::constant(view.into_inner())), env);
+            node.stretch = stretch;
+            node
+        });
+
+        d.register::<Native<ResolvedGradient>>(|_state, _ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let mut node = Node::new(Kind::Gradient(view.into_inner()), env);
+            node.stretch = stretch;
+            node
+        });
+
+        d.register::<Native<GpuSurface>>(|state, _ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let mut node = Node::new(
+                Kind::Gpu(GpuState::new(view.into_inner(), state.gpu(), env)),
+                env,
+            );
             node.stretch = stretch;
             node
         });

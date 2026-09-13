@@ -58,7 +58,7 @@ impl Fixture {
         self.root.set_frame(screen_points(cols, rows));
     }
 
-    fn draw(&mut self, cols: u16, rows: u16) -> String {
+    fn render_buf(&mut self, cols: u16, rows: u16) -> Buffer {
         let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
         self.root.render(
             &mut buf,
@@ -69,7 +69,11 @@ impl Fixture {
                 cursor: &self.cursor,
             },
         );
-        buffer_string(&buf)
+        buf
+    }
+
+    fn draw(&mut self, cols: u16, rows: u16) -> String {
+        buffer_string(&self.render_buf(cols, rows))
     }
 
     fn focus_chain(&self) -> Vec<u32> {
@@ -262,4 +266,151 @@ fn hit_testing_finds_focusable() {
     );
     assert!(fixture.root.activate(chain[0]));
     assert_eq!(counter.get(), 1);
+}
+
+fn srgb(r: u8, g: u8, b: u8) -> waterui_graphics::color::ResolvedColor {
+    waterui_graphics::color::ResolvedColor::from_srgb(waterui_graphics::color::Srgb::new(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    ))
+}
+
+#[test]
+fn linear_gradient_interpolates_per_cell() {
+    use waterui_graphics::gradient_renderer::Gradient;
+    let view = Gradient::linear(
+        vec![(0.0, srgb(255, 0, 0)), (1.0, srgb(0, 0, 255))],
+        [0.0, 0.5],
+        [1.0, 0.5],
+    );
+    let mut fixture = Fixture::new(view, 4, 2);
+    let buf = fixture.render_buf(4, 2);
+
+    // Half-block rendering: fg is the top-half sample, bg the bottom half;
+    // a horizontal gradient therefore lands mostly on `fg`.
+    let ratatui::style::Color::Rgb(left_r, _, left_b) = buf.cell((0, 0)).unwrap().fg else {
+        panic!("expected truecolor left edge");
+    };
+    let ratatui::style::Color::Rgb(right_r, _, right_b) = buf.cell((3, 0)).unwrap().fg else {
+        panic!("expected truecolor right edge");
+    };
+    assert!(
+        left_r > left_b,
+        "left edge should be red-dominant: {left_r}/{left_b}"
+    );
+    assert!(
+        right_b > right_r,
+        "right edge should be blue-dominant: {right_r}/{right_b}"
+    );
+}
+
+#[test]
+fn gradient_sample_respects_geometry() {
+    use waterui_graphics::gradient_renderer::{Gradient, ResolvedGradient};
+    use waterui_tui::gradient::sample;
+
+    // Vertical linear: top is red, bottom is blue.
+    let linear = ResolvedGradient::linear(
+        vec![
+            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(0.0, srgb(255, 0, 0)),
+            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(1.0, srgb(0, 0, 255)),
+        ],
+        [0.5, 0.0],
+        [0.5, 1.0],
+    );
+    let top = sample(&linear, 0.5, 0.01);
+    let bottom = sample(&linear, 0.5, 0.99);
+    assert!(top.red > top.blue, "top should be red: {top:?}");
+    assert!(
+        bottom.blue > bottom.red,
+        "bottom should be blue: {bottom:?}"
+    );
+
+    // Radial: center is red, outside is blue.
+    let radial = ResolvedGradient::radial(
+        vec![
+            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(0.0, srgb(255, 0, 0)),
+            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(1.0, srgb(0, 0, 255)),
+        ],
+        [0.5, 0.5],
+        0.0,
+        0.5,
+    );
+    let center = sample(&radial, 0.5, 0.5);
+    let corner = sample(&radial, 0.0, 0.0);
+    assert!(center.red > center.blue, "center should be red: {center:?}");
+    assert!(
+        corner.blue > corner.red,
+        "corner should be blue: {corner:?}"
+    );
+
+    // A mesh gradient never reaches `ResolvedGradient`; constructing one is
+    // fine but it dispatches through the GPU path instead.
+    let _mesh = Gradient::mesh(
+        2,
+        2,
+        vec![
+            ([0.0, 0.0], srgb(255, 0, 0)),
+            ([1.0, 0.0], srgb(0, 255, 0)),
+            ([0.0, 1.0], srgb(0, 0, 255)),
+            ([1.0, 1.0], srgb(255, 255, 0)),
+        ],
+        true,
+    );
+}
+
+/// A `GpuView` that clears the surface to solid red — exercises the same
+/// `Native<GpuSurface>` path `waterui_image::Image` and mesh gradients take.
+struct ClearView;
+
+impl waterui_graphics::GpuView for ClearView {
+    async fn setup(&mut self, _ctx: &waterui_graphics::GpuContext<'_>, _env: &mut Environment) {}
+
+    fn render(&mut self, frame: &mut waterui_graphics::GpuFrame) {
+        use waterui_graphics::wgpu;
+        let mut encoder = frame
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+        }
+        frame.queue.submit([encoder.finish()]);
+    }
+}
+
+#[test]
+fn gpu_surface_rasterizes_into_half_blocks() {
+    let view = waterui_graphics::GpuSurface::new(ClearView);
+    let mut fixture = Fixture::new(view, 4, 2);
+    let buf = fixture.render_buf(4, 2);
+
+    if !fixture.renderer.gpu_available() {
+        assert!(
+            buffer_string(&buf).contains("[gpu]"),
+            "expected placeholder without a GPU"
+        );
+        return;
+    }
+    let cell = buf.cell((0, 0)).unwrap();
+    assert_eq!(cell.symbol(), "▀", "expected half-block image cell");
+    let ratatui::style::Color::Rgb(r, g, b) = cell.fg else {
+        panic!("expected truecolor pixel");
+    };
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "expected red pixel: {r}/{g}/{b}"
+    );
 }

@@ -8,13 +8,23 @@ use std::io;
 use nami::{Binding, SignalExt, binding};
 use waterui_controls::{button, field, toggle};
 use waterui_core::Str;
-use waterui_graphics::color::{Color, MutedForegroundColor};
+use waterui_graphics::color::{Color, MutedForegroundColor, ResolvedColor, Srgb};
+use waterui_graphics::gradient_renderer::Gradient;
 use waterui_layout::divider::Divider;
+use waterui_layout::frame::Frame;
 use waterui_layout::padding::{EdgeInsets, Padding};
 use waterui_layout::spacer::spacer;
 use waterui_layout::stack::{hstack, vstack};
 use waterui_text::styled::StyledStr;
 use waterui_text::text::text;
+
+fn rgb(r: u8, g: u8, b: u8) -> ResolvedColor {
+    ResolvedColor::from_srgb(Srgb::new(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    ))
+}
 
 fn main() -> io::Result<()> {
     let counter: Binding<i32> = binding(0);
@@ -43,16 +53,37 @@ fn main() -> io::Result<()> {
         }
     });
 
+    let banner = Gradient::linear(
+        vec![(0.0, rgb(90, 160, 250)), (1.0, rgb(180, 140, 250))],
+        [0.0, 0.5],
+        [1.0, 0.5],
+    );
+    let mesh = Gradient::mesh(
+        3,
+        2,
+        vec![
+            ([0.0, 0.0], rgb(255, 90, 90)),
+            ([0.5, 0.0], rgb(255, 200, 80)),
+            ([1.0, 0.0], rgb(120, 220, 120)),
+            ([0.0, 1.0], rgb(80, 140, 255)),
+            ([0.5, 1.0], rgb(200, 120, 255)),
+            ([1.0, 1.0], rgb(90, 220, 220)),
+        ],
+        true,
+    );
+
     let view = Padding::new(
         EdgeInsets::all(8.0),
         vstack((
             text(StyledStr::plain("WaterUI terminal demo").bold()),
+            Frame::new(banner).height(16.0),
             text(counter_text),
             Divider,
             hstack((decrement, spacer(), increment)).spacing(2.0),
             toggle("Enable counting", &enabled),
             field("Name", &name),
             text(greeting.computed()),
+            Frame::new(mesh).height(24.0),
             spacer(),
             text(
                 StyledStr::plain("Tab moves focus · Enter/Space activates · Esc quits")
