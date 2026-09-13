@@ -94,9 +94,6 @@ impl GpuState {
     /// reports one. The protocol is rebuilt when the frame's cell size
     /// changes. Returns `true` when a real image protocol took over the area.
     fn draw_protocol(&self, picker: &Picker, frame: CellRect, buf: &mut Buffer) -> bool {
-        if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
-            return false;
-        }
         let raster = self.raster.borrow();
         let Some(raster) = raster.as_ref() else {
             return false;
@@ -113,7 +110,7 @@ impl GpuState {
             match picker.new_protocol(
                 image::DynamicImage::ImageRgba8(image),
                 size,
-                Resize::Fit(None),
+                Resize::Scale(Some(ratatui_image::FilterType::Triangle)),
             ) {
                 Ok(protocol) => *slot = Some(protocol),
                 Err(error) => {
@@ -145,10 +142,22 @@ impl GpuState {
         theme: &Theme,
         buf: &mut Buffer,
     ) {
-        self.rasterize(
-            u32::from(frame.width).max(1),
-            u32::from(frame.height).max(1) * 2,
-        );
+        let graphics =
+            picker.filter(|picker| !matches!(picker.protocol_type(), ProtocolType::Halfblocks));
+        let (width, height) = match graphics {
+            Some(picker) => {
+                let font = picker.font_size();
+                (
+                    u32::from(frame.width).max(1) * u32::from(font.width),
+                    u32::from(frame.height).max(1) * u32::from(font.height),
+                )
+            }
+            None => (
+                u32::from(frame.width).max(1),
+                u32::from(frame.height).max(1) * 2,
+            ),
+        };
+        self.rasterize(width, height);
         let raster = self.raster.borrow();
         if raster.is_none() {
             let muted = Style::default().fg(theme.muted);
