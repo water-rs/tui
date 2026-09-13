@@ -1,0 +1,24 @@
+[package]
+name = "waterui-tui"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Experimental terminal (TUI) backend for WaterUI"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
+waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core", default-features = false }
+waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
+waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
+waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
+waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics", default-features = false }
+waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
+nami = "0.11.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+unicode-width = "0.2"
+
+[dev-dependencies]
+waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
