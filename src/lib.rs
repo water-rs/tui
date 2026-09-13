@@ -45,12 +45,15 @@ pub mod gpu;
 pub mod gradient;
 pub mod kitty;
 pub mod node;
+mod probe;
 mod renderer;
 pub mod style;
+mod submit;
 pub mod theme;
 pub mod units;
 
 pub use app::{run, run_app};
 pub use node::Node;
 pub use renderer::TuiRenderer;
+pub use submit::OnSubmit;
 pub use theme::install_terminal_theme;

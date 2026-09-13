@@ -857,8 +857,24 @@ impl Node {
                     value.set(!value.get());
                     true
                 }
-                Kind::Field(field) => field_key(field, key),
-                Kind::Secure(state) => secure_key(state, key),
+                Kind::Field(field) => {
+                    if key.code == KeyCode::Enter
+                        && let Some(submit) = self.env.get::<crate::OnSubmit>()
+                    {
+                        (submit.0.borrow_mut())(&self.env);
+                        return true;
+                    }
+                    field_key(field, key)
+                }
+                Kind::Secure(state) => {
+                    if key.code == KeyCode::Enter
+                        && let Some(submit) = self.env.get::<crate::OnSubmit>()
+                    {
+                        (submit.0.borrow_mut())(&self.env);
+                        return true;
+                    }
+                    secure_key(state, key)
+                }
                 Kind::Slider { value, range, .. } => {
                     let step = (*range.end() - *range.start()) / 20.0;
                     match key.code {
