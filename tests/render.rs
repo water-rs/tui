@@ -67,6 +67,7 @@ impl Fixture {
                 theme: &self.theme,
                 focused: None,
                 cursor: &self.cursor,
+                picker: None,
             },
         );
         buf
@@ -195,6 +196,7 @@ fn styled_str_maps_bold_and_color() {
             theme: &fixture.theme,
             focused: None,
             cursor: &fixture.cursor,
+            picker: None,
         },
     );
     let cell = buf.cell((0, 0)).unwrap();

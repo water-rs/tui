@@ -39,6 +39,12 @@ pub fn run(view: impl View) -> io::Result<()> {
 
     let mut guard = TerminalGuard::enter()?;
 
+    // Probe terminal graphics support once, before the event loop reads
+    // stdin. Terminals without a graphics protocol fall back to half-blocks.
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .map_err(|error| tracing::warn!("terminal graphics probe failed: {error}"))
+        .ok();
+
     let mut focus_chain = Vec::new();
     root.collect_focus(&mut focus_chain);
     let mut focused = focus_chain.first().copied();
@@ -57,6 +63,7 @@ pub fn run(view: impl View) -> io::Result<()> {
                     theme: &theme,
                     focused,
                     cursor: &cursor,
+                    picker: picker.as_ref(),
                 },
             );
             if let Some(position) = cursor.get() {

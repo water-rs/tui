@@ -21,6 +21,8 @@ crossterm = "0.29"
 unicode-width = "0.2"
 pollster = "1.0"
 tracing = "0.1"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", default-features = false }
 
 [dev-dependencies]
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }

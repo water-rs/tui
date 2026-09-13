@@ -44,6 +44,10 @@ pub struct DrawCtx<'a> {
     pub focused: Option<u32>,
     /// Receives the terminal cursor position when a focused field draws.
     pub cursor: &'a Cell<Option<(u16, u16)>>,
+    /// Terminal graphics protocol picker, when the terminal supports one.
+    /// `None` (headless buffers, terminals without graphics) falls back to
+    /// half-block rendering.
+    pub picker: Option<&'a ratatui_image::picker::Picker>,
 }
 
 /// A live editable [`TextField`](waterui_controls::text_field::TextField) node.
@@ -302,7 +306,7 @@ impl Node {
                 draw_gradient(gradient, frame, area, ctx.theme.background, buf);
             }
             Kind::Gpu(state) => {
-                state.draw(frame, area, ctx.theme, buf);
+                state.draw(frame, area, ctx.picker, ctx.theme, buf);
             }
         }
 

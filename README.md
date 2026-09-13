@@ -27,10 +27,15 @@ background the bottom half's, giving two gradient rows per terminal row.
 
 **GPU surfaces** (`Image`, `Gradient::mesh`, `ShaderSurface`, any `GpuView`)
 are rendered once into an offscreen wgpu texture at the node's cell size and
-read back as `RGBA8`, then mapped onto `▀` cells — two source pixel rows per
-terminal row, alpha-composited over the cell underneath. Rasterization is a
-snapshot: animated `GpuView`s show their first frame. Hosts without a usable
-GPU adapter draw a `[gpu]` placeholder instead of panicking.
+read back as `RGBA8`. On terminals with a graphics protocol the pixels are
+encoded once via [ratatui-image](https://crates.io/crates/ratatui-image) and
+drawn as a real image — Kitty, Sixel, and iTerm2 are probed with
+`Picker::from_query_stdio` when the app starts. On terminals without graphics
+support (or when the node is partially off-screen) the pixels map onto `▀`
+half-block cells — two source pixel rows per terminal row, alpha-composited
+over the cell underneath. Rasterization is a snapshot: animated `GpuView`s
+show their first frame. Hosts without a usable GPU adapter draw a `[gpu]`
+placeholder instead of panicking.
 
 Not supported (by design): video, maps, web views, canvas — a terminal has no
 such primitives. `SystemIcon` renders as a `[name]` placeholder since no OS
