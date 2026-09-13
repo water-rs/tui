@@ -31,6 +31,14 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false }
 base64-simd = "0.8"
 flate2 = "1.1"
+rustix = { version = "1.1.4", features = ["termios"] }
+
+[dev-dependencies]
+aither-acp = "0.4"
+aither-mcp = "0.4"
+async-channel = "2"
+async-process = "2.5.0"
+waterui-text = { version = "0.4.1", features = ["markdown"] }
 
 # This repository develops against the WaterUI checkout next door; the patch
 # table is what keeps the version requirements above resolving to it. A

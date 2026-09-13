@@ -94,7 +94,6 @@ fn run_inner(
     env: Environment,
     local_tasks: mpsc::Receiver<Runnable>,
 ) -> io::Result<()> {
-
     let mut renderer = TuiRenderer::new();
     let dirty = renderer.dirty();
     let mut root = renderer.dispatch(view, &env);
@@ -103,7 +102,7 @@ fn run_inner(
 
     // Probe terminal graphics support once, before the event loop reads
     // stdin. Terminals without a graphics protocol fall back to half-blocks.
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
+    let picker = crate::probe::picker()
         .map_err(|error| tracing::warn!("terminal graphics probe failed: {error}"))
         .ok();
 
