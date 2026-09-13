@@ -68,10 +68,12 @@ use waterui_layout::stack::vstack;
 use waterui_text::text::text;
 
 fn main() -> std::io::Result<()> {
-    waterui_tui::run(vstack((
-        text("Hello"),
-        button("Quit").action(|| std::process::exit(0)),
-    )))
+    waterui_tui::run(|| {
+        vstack((
+            text("Hello"),
+            button("Quit").action(|| std::process::exit(0)),
+        ))
+    })
 }
 ```
 

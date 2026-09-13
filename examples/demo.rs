@@ -136,5 +136,5 @@ fn main() -> io::Result<()> {
         .spacing(10.0),
     );
 
-    waterui_tui::run(view)
+    waterui_tui::run(move || view)
 }

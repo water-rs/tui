@@ -30,13 +30,18 @@ use crate::theme::install_terminal_theme;
 /// on the alternate screen, and loops until `Esc` or `Ctrl-C`. The terminal
 /// state is restored on exit and on panic.
 ///
+/// The view is a closure because the executors are installed first: view
+/// composition may already spawn reactive work, and `spawn_local` panics
+/// without a local executor on the thread.
+///
 /// # Errors
 ///
 /// Returns terminal I/O errors from `crossterm`/`ratatui`.
-pub fn run(view: impl View) -> io::Result<()> {
+pub fn run<V: View>(view: impl FnOnce() -> V) -> io::Result<()> {
+    init_executors();
     let mut env = Environment::new();
     install_terminal_theme(&mut env);
-    run_inner(view, env)
+    run_inner(view(), env)
 }
 
 /// Runs a WaterUI [`App`] as a full-screen terminal application.
@@ -47,11 +52,16 @@ pub fn run(view: impl View) -> io::Result<()> {
 /// single surface, so declaring windows beyond the main window is a programmer
 /// error and panics.
 ///
+/// The app is a closure for the same reason as [`run`]: composing the app —
+/// including `configure_environment!` — may spawn work, so the executors must
+/// already be installed when it runs.
+///
 /// # Errors
 ///
 /// Returns terminal I/O errors from `crossterm`/`ratatui`.
-pub fn run_app(app: App) -> io::Result<()> {
-    let (mut windows, _menu_bar, mut env) = app.into_parts();
+pub fn run_app(app: impl FnOnce() -> App) -> io::Result<()> {
+    init_executors();
+    let (mut windows, _menu_bar, mut env) = app().into_parts();
     install_terminal_theme(&mut env);
     assert!(
         windows.len() == 1,
@@ -63,10 +73,19 @@ pub fn run_app(app: App) -> io::Result<()> {
     run_inner(window.build_content(), env)
 }
 
+/// Installs the global and thread-local executors before any app code runs.
+///
+/// `spawn` work goes to the platform's native executor; `spawn_local` work is
+/// parked and drained between frames by the event loop so it never re-enters
+/// the code that spawned it.
+fn init_executors() {
+    let _ = executor_core::try_init_global_executor(native_executor::NativeExecutor::new());
+    let _ = executor_core::try_init_local_executor(
+        waterui_internal::task::monitored_local_executor(TuiLocalExecutor),
+    );
+}
+
 fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
-    // The main loop owns local task execution: `spawn_local` work is parked and
-    // drained between frames so it never re-enters the code that spawned it.
-    let _ = executor_core::try_init_local_executor(TuiLocalExecutor);
 
     let mut renderer = TuiRenderer::new();
     let dirty = renderer.dirty();
