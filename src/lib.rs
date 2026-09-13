@@ -33,9 +33,11 @@
 //! # Entry points
 //!
 //! [`run`] is the batteries-included path: it installs the terminal theme,
-//! takes over the terminal, and runs the event loop. For embedding into a
-//! larger terminal application, drive [`TuiRenderer`] and [`node::Node`]
-//! directly.
+//! takes over the terminal, and runs the event loop. [`run_app`] is what the
+//! `water run --tui` launcher calls: it takes the application's composed
+//! [`waterui_internal::app::App`], so its environment and window content come
+//! from the composition root. For embedding into a larger terminal
+//! application, drive [`TuiRenderer`] and [`node::Node`] directly.
 
 mod app;
 pub mod gpu;
@@ -47,7 +49,7 @@ pub mod style;
 pub mod theme;
 pub mod units;
 
-pub use app::run;
+pub use app::{run, run_app};
 pub use node::Node;
 pub use renderer::TuiRenderer;
 pub use theme::install_terminal_theme;

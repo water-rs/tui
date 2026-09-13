@@ -8,18 +8,19 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
-waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core", default-features = false }
-waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
-waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
-waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
-waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics", default-features = false, features = ["gpu"] }
-waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
-waterui-internal = { path = "/Users/lexoliu/Coding/waterui/src", default-features = false }
-waterui-form = { path = "/Users/lexoliu/Coding/waterui/components/foundation/form" }
-waterui-navigation = { path = "/Users/lexoliu/Coding/waterui/components/foundation/navigation" }
-waterui-shape = { path = "/Users/lexoliu/Coding/waterui/components/foundation/shape" }
+waterui-core = "0.3.2"
+waterui-backend-core = { version = "0.1.2", default-features = false }
+waterui-layout = "0.3.2"
+waterui-text = "0.4.1"
+waterui-controls = "0.3.2"
+waterui-graphics = { version = "0.4.1", default-features = false, features = ["gpu"] }
+waterui-icon = "0.3.2"
+waterui-internal = { version = "0.4.1", default-features = false }
+waterui-form = "0.3.2"
+waterui-navigation = "0.3.2"
+waterui-shape = "0.1.2"
 nami = "0.11.2"
+executor-core = { version = "0.7.1", features = ["std"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 unicode-width = "0.2"
@@ -30,5 +31,19 @@ image = { version = "0.25", default-features = false }
 base64-simd = "0.8"
 flate2 = "1.1"
 
-[dev-dependencies]
+# This repository develops against the WaterUI checkout next door; the patch
+# table is what keeps the version requirements above resolving to it. A
+# consumer that pins `waterui-tui` by git supplies its own `[patch]` — the
+# `water` CLI writes one into the generated crate.
+[patch.crates-io]
+waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
+waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core" }
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
+waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
+waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
+waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics" }
+waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
+waterui-internal = { path = "/Users/lexoliu/Coding/waterui/src" }
+waterui-form = { path = "/Users/lexoliu/Coding/waterui/components/foundation/form" }
+waterui-navigation = { path = "/Users/lexoliu/Coding/waterui/components/foundation/navigation" }
+waterui-shape = { path = "/Users/lexoliu/Coding/waterui/components/foundation/shape" }

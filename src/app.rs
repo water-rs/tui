@@ -1,6 +1,7 @@
 //! The terminal event loop.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io::{self, Stdout, stdout};
 use std::panic;
 use std::time::Duration;
@@ -11,9 +12,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use executor_core::LocalExecutor;
+use executor_core::async_task::{self, AsyncTask, Runnable};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use waterui_core::{Environment, View};
+use waterui_internal::app::App;
 
 use crate::node::{DrawCtx, screen_points};
 use crate::renderer::TuiRenderer;
@@ -32,6 +36,37 @@ use crate::theme::install_terminal_theme;
 pub fn run(view: impl View) -> io::Result<()> {
     let mut env = Environment::new();
     install_terminal_theme(&mut env);
+    run_inner(view, env)
+}
+
+/// Runs a WaterUI [`App`] as a full-screen terminal application.
+///
+/// This is the entry point generated launcher crates use: the application's own
+/// environment is the composition root, the terminal theme is installed into
+/// it, and the main window's content becomes the screen. A terminal has a
+/// single surface, so declaring windows beyond the main window is a programmer
+/// error and panics.
+///
+/// # Errors
+///
+/// Returns terminal I/O errors from `crossterm`/`ratatui`.
+pub fn run_app(app: App) -> io::Result<()> {
+    let (mut windows, _menu_bar, mut env) = app.into_parts();
+    install_terminal_theme(&mut env);
+    assert!(
+        windows.len() == 1,
+        "the TUI backend renders a single window; this app declares {} — \
+         use a desktop backend for multi-window applications",
+        windows.len()
+    );
+    let window = windows.pop().expect("the main window exists");
+    run_inner(window.build_content(), env)
+}
+
+fn run_inner(view: impl View, env: Environment) -> io::Result<()> {
+    // The main loop owns local task execution: `spawn_local` work is parked and
+    // drained between frames so it never re-enters the code that spawned it.
+    let _ = executor_core::try_init_local_executor(TuiLocalExecutor);
 
     let mut renderer = TuiRenderer::new();
     let dirty = renderer.dirty();
@@ -52,6 +87,9 @@ pub fn run(view: impl View) -> io::Result<()> {
     let cursor = Cell::new(None);
 
     'app: loop {
+        if drain_parked_local_work() {
+            dirty.set(true);
+        }
         for id in renderer.take_focus_requests() {
             focused = Some(id);
         }
@@ -85,6 +123,10 @@ pub fn run(view: impl View) -> io::Result<()> {
 
         dirty.set(false);
         while !dirty.get() {
+            if drain_parked_local_work() {
+                dirty.set(true);
+                continue;
+            }
             // Spinners advance on a timer; without them the loop only wakes
             // for input or a signal-driven dirty flag.
             let frame_ms = if renderer.animated() { 80 } else { 250 };
@@ -165,6 +207,44 @@ pub fn run(view: impl View) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+thread_local! {
+    /// `spawn_local` work parked between frames. Runnables are deliberately not
+    /// run inline: reactive work re-enters the code under render, which
+    /// deadlocks when polled in the middle of the call that spawned it.
+    static PARKED_RUNNABLES: RefCell<Vec<Runnable>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Queues `spawn_local` work for the terminal event loop to drain.
+#[derive(Clone, Copy, Debug, Default)]
+struct TuiLocalExecutor;
+
+impl LocalExecutor for TuiLocalExecutor {
+    type Task<T: 'static> = AsyncTask<T>;
+
+    fn spawn_local<Fut>(&self, fut: Fut) -> Self::Task<Fut::Output>
+    where
+        Fut: Future + 'static,
+    {
+        let (runnable, task) = async_task::spawn_local(fut, |runnable: Runnable| {
+            PARKED_RUNNABLES.with(|parked| parked.borrow_mut().push(runnable));
+        });
+        runnable.schedule();
+        task
+    }
+}
+
+/// Runs the work `spawn_local` parked since the last drain, returning whether
+/// any ran. Each drained runnable may park more work; this drains only what was
+/// already queued, so a task that reschedules itself is polled next frame.
+fn drain_parked_local_work() -> bool {
+    let ready = PARKED_RUNNABLES.with(|parked| core::mem::take(&mut *parked.borrow_mut()));
+    let ran = !ready.is_empty();
+    for runnable in ready {
+        runnable.run();
+    }
+    ran
 }
 
 /// Restores the terminal when dropped, including through unwinding.
