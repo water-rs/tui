@@ -15,7 +15,7 @@ use nami::{Binding, Computed, Signal};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as CellRect;
 use ratatui::style::{Modifier, Style};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use waterui_controls::button::ButtonStyle;
 use waterui_controls::toggle::ToggleStyle;
 use waterui_core::Retain;
@@ -37,7 +37,7 @@ use waterui_text::styled::StyledStr;
 use crate::gpu::GpuState;
 use crate::gradient::draw_gradient;
 use crate::style::{Theme, chunk_style, tui_color};
-use crate::units::{LINE_HEIGHT, PT_PER_ROW, cols_for, rows_for, to_cells};
+use crate::units::{LINE_HEIGHT, PT_PER_COL, PT_PER_ROW, cols_for, rows_for, to_cells};
 
 /// Everything a frame draw needs that nodes cannot own themselves.
 pub struct DrawCtx<'a> {
@@ -460,6 +460,10 @@ impl Node {
                     scroll
                         .extent
                         .set((cols_for(size.width), rows_for(size.height)));
+                    // The reachable range changed even when the offset did
+                    // not — a grown transcript raises `max`, which follow-mode
+                    // listeners need to re-evaluate.
+                    self.notify_scroll();
                 }
             }
             Kind::Tabs { selection, tabs } => {
@@ -747,6 +751,7 @@ impl Node {
                 // shifted by the offset and clipped to the visible viewport.
                 if let Some(target) = scroll.requested.take() {
                     scroll.offset.set(self.clamp_offset(target));
+                    self.notify_scroll();
                 }
                 let (ox, oy) = scroll.offset.get();
                 let inner = (shift.0 - ox, shift.1 - oy);
@@ -995,6 +1000,7 @@ impl Node {
             return false;
         }
         scroll.offset.set(next);
+        self.notify_scroll();
         true
     }
 
@@ -1009,7 +1015,28 @@ impl Node {
             return false;
         }
         scroll.offset.set(next);
+        self.notify_scroll();
         true
+    }
+
+    /// Reports the current offset and reachable range to an [`crate::OnScroll`]
+    /// installed on this scroll view's environment, if any.
+    fn notify_scroll(&self) {
+        let Kind::Scroll(scroll) = &self.kind else {
+            return;
+        };
+        let Some(callback) = self.env.get::<crate::OnScroll>() else {
+            return;
+        };
+        let viewport = self.frame.get();
+        let (cw, ch) = scroll.extent.get();
+        (callback.0.borrow_mut())(crate::ScrollMetrics {
+            offset: scroll.offset.get(),
+            max: (
+                (i32::from(cw) - i32::from(viewport.width)).max(0),
+                (i32::from(ch) - i32::from(viewport.height)).max(0),
+            ),
+        });
     }
 
     /// Delivers a mouse wheel scroll at a screen cell; returns `true` when a
@@ -1190,7 +1217,7 @@ impl SubView for Node {
                 content,
                 line_limit,
                 ..
-            } => measure_text(&content.get(), *line_limit),
+            } => measure_text(&content.get(), *line_limit, proposal.width),
             Kind::Button { style, .. } => {
                 let label = self
                     .children
@@ -1365,13 +1392,42 @@ const fn bordered(style: ButtonStyle) -> bool {
     )
 }
 
-fn measure_text(content: &StyledStr, line_limit: Option<usize>) -> Size {
+fn measure_text(
+    content: &StyledStr,
+    line_limit: Option<usize>,
+    proposal_width: Option<f32>,
+) -> Size {
     let plain = content.to_plain();
+    // A bounded proposal wraps text to that width; report the wrapped height
+    // so containers (scroll extents in particular) see the real row count.
+    let wrap = proposal_width
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .map(|w| (w / PT_PER_COL).floor() as usize);
     let mut width = 0usize;
     let mut lines = 0usize;
     for line in plain.split('\n') {
-        width = width.max(line.width());
-        lines += 1;
+        let chars: Vec<char> = line.chars().collect();
+        match wrap {
+            Some(wrap) if wrap > 0 => {
+                let mut visual = 0usize;
+                let mut widest = 0usize;
+                for_each_wrap(&chars, wrap, |start, end| {
+                    visual += 1;
+                    widest = widest.max(
+                        chars[start..end]
+                            .iter()
+                            .map(|&ch| UnicodeWidthChar::width(ch).unwrap_or(0).max(1))
+                            .sum::<usize>(),
+                    );
+                });
+                lines += visual.max(1);
+                width = width.max(widest);
+            }
+            _ => {
+                width = width.max(line.width());
+                lines += 1;
+            }
+        }
     }
     if let Some(limit) = line_limit {
         lines = lines.min(limit);
@@ -1413,6 +1469,16 @@ fn draw_text(
                 line.push((piece.to_owned(), style));
             }
         }
+    }
+    // Word-wrap each logical line to the frame width — text past the right
+    // edge must land on the next row, not get clipped away.
+    let wrap = usize::from(geo.frame_width);
+    if wrap > 0 {
+        let mut wrapped = Vec::with_capacity(lines.len());
+        for line in &lines {
+            wrap_line(line, wrap, &mut wrapped);
+        }
+        lines = wrapped;
     }
     // Lines anchor to the content `origin`, which scroll shifts out from
     // under `clip` — never to the clipped viewport, or scrolled content would
@@ -1457,6 +1523,69 @@ fn draw_text(
             x += w;
         }
     }
+}
+
+/// Greedy word wrap: calls `f` with the `(start, end)` char-index range of
+/// each visual line of at most `width` display columns. Breaks after the last
+/// space that fits; a run longer than `width` hard-breaks at the edge.
+fn for_each_wrap(chars: &[char], width: usize, mut f: impl FnMut(usize, usize)) {
+    let mut i = 0;
+    while i < chars.len() {
+        let mut col = 0;
+        let mut end = i;
+        let mut space = None;
+        while end < chars.len() {
+            let w = UnicodeWidthChar::width(chars[end]).unwrap_or(0).max(1);
+            if col + w > width {
+                break;
+            }
+            col += w;
+            if chars[end] == ' ' {
+                space = Some(end);
+            }
+            end += 1;
+        }
+        if end == chars.len() {
+            f(i, end);
+            break;
+        }
+        if let Some(space) = space {
+            f(i, space);
+            i = space + 1;
+            // Collapse the run of spaces at the break onto this line.
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+        } else {
+            f(i, end.max(i + 1));
+            i = end.max(i + 1);
+        }
+    }
+}
+
+/// Word-wraps one styled logical line into visual lines of at most `width`
+/// columns, preserving per-char styles.
+fn wrap_line(line: &[(String, Style)], width: usize, out: &mut Vec<Vec<(String, Style)>>) {
+    let flat: Vec<(char, Style)> = line
+        .iter()
+        .flat_map(|(text, style)| text.chars().map(move |ch| (ch, *style)))
+        .collect();
+    if flat.is_empty() {
+        out.push(Vec::new());
+        return;
+    }
+    let chars: Vec<char> = flat.iter().map(|(ch, _)| *ch).collect();
+    for_each_wrap(&chars, width, |start, end| {
+        // Coalesce consecutive same-styled chars back into runs.
+        let mut visual: Vec<(String, Style)> = Vec::new();
+        for &(ch, style) in &flat[start..end] {
+            match visual.last_mut() {
+                Some((text, s)) if *s == style => text.push(ch),
+                _ => visual.push((ch.to_string(), style)),
+            }
+        }
+        out.push(visual);
+    });
 }
 
 /// Drops the first `cols` display columns of `text` — the leading edge of a

@@ -8,7 +8,7 @@
 //!
 //! `Enter` sends, `Tab`/`Shift-Tab` moves focus, `Esc`/`Ctrl-C` quits.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -43,7 +43,7 @@ use waterui_layout::scroll::{ScrollController, scroll};
 use waterui_layout::stack::{hstack, vstack};
 use waterui_text::styled::{Style, StyledStr};
 use waterui_text::text::text;
-use waterui_tui::OnSubmit;
+use waterui_tui::{OnScroll, OnSubmit};
 
 /// A transcript row: a role prefix plus its text.
 struct Line {
@@ -588,25 +588,41 @@ fn prefix_style(prefix: &str) -> Style {
 
 /// Flattens the transcript into one styled string: a colored prefix line per
 /// row, agent rows rendered through the markdown parser.
-fn render_transcript(lines: &[Line]) -> StyledStr {
+///
+/// This runs on every repaint, so markdown results are memoized per row:
+/// during a stream only the row actively being appended re-parses.
+fn render_transcript(lines: &[Line], cache: &mut Vec<(u64, StyledStr)>) -> StyledStr {
+    use std::hash::{Hash, Hasher};
     let mut out = StyledStr::empty();
-    for line in lines {
+    cache.resize_with(lines.len(), || (0, StyledStr::empty()));
+    for (line, cached) in lines.iter().zip(cache.iter_mut()) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        line.prefix.hash(&mut hasher);
+        line.markdown.hash(&mut hasher);
+        line.text.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        if cached.0 != fingerprint {
+            cached.0 = fingerprint;
+            cached.1 = if line.markdown {
+                StyledStr::from_markdown(&line.text)
+            } else if line.prefix == "term" && line.text.len() > TERM_DISPLAY_CAP {
+                // Terminal output is unbounded; show the tail, which is where
+                // a running command's live output accumulates.
+                let mut start = line.text.len() - TERM_DISPLAY_CAP;
+                while !line.text.is_char_boundary(start) {
+                    start += 1;
+                }
+                let mut shown = StyledStr::empty();
+                shown.push_str("…\n");
+                shown.push_str(line.text[start..].to_string());
+                shown
+            } else {
+                StyledStr::plain(line.text.clone())
+            };
+        }
         out.push(format!("{}\n", line.prefix), prefix_style(line.prefix));
-        if line.markdown {
-            for (text, style) in StyledStr::from_markdown(&line.text).chunks() {
-                out.push(text.clone(), style.clone());
-            }
-        } else if line.prefix == "term" && line.text.len() > TERM_DISPLAY_CAP {
-            // Terminal output is unbounded; show the tail, which is where a
-            // running command's live output accumulates.
-            let mut start = line.text.len() - TERM_DISPLAY_CAP;
-            while !line.text.is_char_boundary(start) {
-                start += 1;
-            }
-            out.push_str("…\n");
-            out.push_str(line.text[start..].to_string());
-        } else {
-            out.push_str(line.text.clone());
+        for (text, style) in cached.1.chunks() {
+            out.push(text.clone(), style.clone());
         }
         out.push_str("\n\n");
     }
@@ -635,6 +651,18 @@ fn app() -> impl View {
     let session: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let scroller = ScrollController::<Point>::default();
     let focus: Binding<Option<Focus>> = binding(None);
+    // Follow mode: new transcript content keeps the view pinned to the bottom
+    // only while the user hasn't scrolled up to read back.
+    let following = Rc::new(Cell::new(true));
+    let follow = {
+        let following = following.clone();
+        let scroller = scroller.clone();
+        move || {
+            if following.get() {
+                scroller.scroll_to(Point::new(0.0, f32::MAX));
+            }
+        }
+    };
 
     // Focus the input once the tree is dispatched: the watcher that turns a
     // `Focused` metadata value into a focus request only exists after
@@ -679,7 +707,7 @@ fn app() -> impl View {
         executor_core::spawn_local({
             let session = session.clone();
             let lines = lines.clone();
-            let scroller = scroller.clone();
+            let follow = follow.clone();
             async move {
                 match client.initialize().await {
                     Ok(init) => {
@@ -705,7 +733,7 @@ fn app() -> impl View {
                         push_line(&lines, "status", format!("session/new failed: {error}"));
                     }
                 }
-                scroller.scroll_to(Point::new(0.0, f32::MAX));
+                follow();
             }
         })
         .detach();
@@ -714,12 +742,12 @@ fn app() -> impl View {
     // Drain forwarded agent traffic on the main thread.
     executor_core::spawn_local({
         let lines = lines.clone();
-        let scroller = scroller.clone();
+        let follow = follow.clone();
         async move {
             let mut terms = HashMap::new();
             while let Ok(event) = rx.recv().await {
                 apply(&lines, &mut terms, event);
-                scroller.scroll_to(Point::new(0.0, f32::MAX));
+                follow();
             }
         }
     })
@@ -732,6 +760,7 @@ fn app() -> impl View {
         let busy = busy.clone();
         let session = session.clone();
         let scroller = scroller.clone();
+        let follow = follow.clone();
         move || {
             if busy.get() {
                 return;
@@ -752,10 +781,12 @@ fn app() -> impl View {
             input.set(Str::from(""));
             push_line(&lines, "you", text);
             busy.set(true);
+            // Sending your own message always snaps to the bottom and
+            // re-engages follow mode.
             scroller.scroll_to(Point::new(0.0, f32::MAX));
             let lines = lines.clone();
             let busy = busy.clone();
-            let scroller = scroller.clone();
+            let follow = follow.clone();
             let text = text.to_string();
             executor_core::spawn_local(async move {
                 let result = client
@@ -771,13 +802,18 @@ fn app() -> impl View {
                     push_line(&lines, "status", format!("prompt failed: {error}"));
                 }
                 busy.set(false);
-                scroller.scroll_to(Point::new(0.0, f32::MAX));
+                follow();
             })
             .detach();
         }
     };
 
-    let transcript = lines.map(|lines| render_transcript(&lines)).computed();
+    let transcript = {
+        let cache = Rc::new(RefCell::new(Vec::new()));
+        lines
+            .map(move |lines| render_transcript(&lines, &mut cache.borrow_mut()))
+            .computed()
+    };
     let status = busy
         .map(|busy| {
             if busy {
@@ -807,7 +843,10 @@ fn app() -> impl View {
 
     vstack((
         header,
-        scroll(text(transcript)).scroll_controller(&scroller),
+        with(
+            scroll(text(transcript)).scroll_controller(&scroller),
+            OnScroll::new(move |metrics| following.set(metrics.at_end())),
+        ),
         text(status),
         Divider,
         hstack((prompt_field, send_button)),
