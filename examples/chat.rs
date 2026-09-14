@@ -9,19 +9,28 @@
 //! `Enter` sends, `Tab`/`Shift-Tab` moves focus, `Esc`/`Ctrl-C` quits.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::pin::Pin;
+use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    AcpClient, ClientHandler, ContentBlock, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionParams, RequestPermissionResult, SessionNotification, SessionUpdate,
-    TextContent,
+    AcpClient, ClientCapabilities, ClientHandler, ContentBlock, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
+    SessionNotification, SessionUpdate, TerminalCreateParams, TerminalCreateResult,
+    TerminalExitStatus, TerminalKillParams, TerminalKillResult, TerminalOutputParams,
+    TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult, TerminalWaitForExitParams,
+    TextContent, ToolCallContent,
 };
 use aither_mcp::protocol::JsonRpcError;
+use event_listener::Event;
+use futures_lite::AsyncReadExt;
 use nami::{Binding, SignalExt, binding};
 use waterui_controls::{button, field};
 use waterui_core::env::with;
@@ -55,25 +64,337 @@ impl Clone for Line {
 }
 
 /// Agent traffic forwarded to the UI: session updates plus notes the client
-/// handler itself wants to surface (permission auto-approvals).
+/// handler itself wants to surface (permission auto-approvals, terminal
+/// lifecycle and output).
 enum AgentEvent {
     Update(Box<SessionNotification>),
     Note(String),
+    /// A `terminal/create` happened: `command` labels the transcript block.
+    TermStart {
+        /// The id returned to the agent.
+        terminal_id: String,
+        /// Displayed command line (`$ cmd args…`).
+        command: String,
+    },
+    /// A terminal's retained output, ANSI-stripped and complete (not a delta).
+    Term {
+        /// Which terminal block this output belongs to.
+        terminal_id: String,
+        /// Full retained output so far.
+        text: String,
+    },
 }
 
-/// `ClientHandler` that forwards every session update to the UI thread. All
-/// state mutation happens on the receiver side; the handler only carries a
-/// channel endpoint, so it stays `Send` on the connection task.
+/// Live `terminal/*` sessions keyed by the ids we hand the agent.
+#[derive(Default)]
+struct Terminals {
+    map: Mutex<HashMap<String, Arc<Terminal>>>,
+    next: AtomicU64,
+}
+
+impl Terminals {
+    fn get(&self, terminal_id: &str) -> Option<Arc<Terminal>> {
+        self.map.lock().unwrap().get(terminal_id).cloned()
+    }
+
+    fn lock_remove(&self, terminal_id: &str) -> Option<Arc<Terminal>> {
+        self.map.lock().unwrap().remove(terminal_id)
+    }
+}
+
+/// One running terminal: a piped child whose output is retained (capped at
+/// the requested byte limit) and mirrored into the transcript as it arrives.
+struct Terminal {
+    retained: Mutex<Retained>,
+    status: Mutex<Option<TerminalExitStatus>>,
+    /// Broadcast when `status` is written — `wait_for_exit` waits on it.
+    exited: Event,
+    /// Child pid, for `terminal/kill`/`release`.
+    pid: u32,
+}
+
+impl Terminal {
+    /// SIGKILLs the child if it has not exited; the exit task records the
+    /// status, so this is a no-op for finished terminals.
+    fn kill(&self) {
+        if self.status.lock().unwrap().is_some() {
+            return;
+        }
+        if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// Drains one child pipe into the retained buffer, mirroring the full
+/// ANSI-stripped output into the transcript on every chunk.
+async fn drain_pipe(
+    mut pipe: Pin<Box<dyn futures_lite::AsyncRead + Send>>,
+    terminal: Arc<Terminal>,
+    terminal_id: String,
+    tx: async_channel::Sender<AgentEvent>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let text = {
+                    let mut retained = terminal.retained.lock().unwrap();
+                    retained.push(&buf[..n]);
+                    String::from_utf8_lossy(&strip_ansi_escapes::strip(&retained.bytes))
+                        .into_owned()
+                };
+                let _ = tx
+                    .send(AgentEvent::Term {
+                        terminal_id: terminal_id.clone(),
+                        text,
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+/// Waits for the child to exit, records the status, and wakes
+/// `wait_for_exit` listeners. Owns the `Child` so `kill_on_drop` keeps
+/// working for the child's lifetime.
+async fn wait_exit(mut child: async_process::Child, terminal: Arc<Terminal>) {
+    let status = child.status().await;
+    let exit = match status {
+        Ok(status) => TerminalExitStatus {
+            exit_code: status.code().map(i64::from),
+            signal: signal_name(&status),
+            meta: None,
+        },
+        Err(_) => TerminalExitStatus {
+            exit_code: None,
+            signal: Some("lost".to_string()),
+            meta: None,
+        },
+    };
+    *terminal.status.lock().unwrap() = Some(exit);
+    terminal.exited.notify(usize::MAX);
+}
+
+/// The terminating signal name on unix; `None` elsewhere.
+fn signal_name(status: &ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|signal| signal.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// Retained terminal output.
+struct Retained {
+    bytes: Vec<u8>,
+    limit: u64,
+    truncated: bool,
+}
+
+impl Retained {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        let limit = self.limit as usize;
+        if self.bytes.len() > limit {
+            self.bytes.drain(..self.bytes.len() - limit);
+            self.truncated = true;
+        }
+    }
+}
+
+/// `ClientHandler` that forwards every session update to the UI thread and
+/// runs the `terminal/*` backend. State mutation happens on the receiver
+/// side; the handler only carries a channel endpoint plus the terminal table,
+/// so it stays `Send` on the connection task.
 struct Forwarder {
     tx: async_channel::Sender<AgentEvent>,
+    terminals: Arc<Terminals>,
 }
 
+/// Default cap on retained terminal output when the agent does not set one.
+const TERMINAL_OUTPUT_LIMIT: u64 = 256 * 1024;
+
+/// Characters of a terminal block's tail rendered in the transcript.
+const TERM_DISPLAY_CAP: usize = 8 * 1024;
+
 impl ClientHandler for Forwarder {
+    fn capabilities(&self) -> ClientCapabilities {
+        ClientCapabilities {
+            terminal: true,
+            ..ClientCapabilities::default()
+        }
+    }
+
     async fn session_update(&self, notification: SessionNotification) {
         let _ = self
             .tx
             .send(AgentEvent::Update(Box::new(notification)))
             .await;
+    }
+
+    async fn terminal_create(
+        &self,
+        params: TerminalCreateParams,
+    ) -> Result<TerminalCreateResult, JsonRpcError> {
+        tracing::info!(
+            command = %params.command,
+            args = ?params.args,
+            cwd = ?params.cwd,
+            env = params.env.len(),
+            "terminal/create"
+        );
+        // `command` is a command line, not a program path — devin sends raw
+        // shell strings (e.g. `for i in …; done`), while spec-style agents
+        // send `command` + `args`. Running `sh -c` with the args appended
+        // shell-quoted covers both; `/bin/sh` keeps it POSIX even when the
+        // user's $SHELL is fish or another non-POSIX shell.
+        let mut line = params.command.clone();
+        for arg in &params.args {
+            line.push(' ');
+            line.push_str(&shell_escape::escape(arg.clone().into()));
+        }
+        let mut command = async_process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(&line)
+            .envs(
+                params
+                    .env
+                    .iter()
+                    .map(|var| (var.name.clone(), var.value.clone())),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(cwd) = &params.cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!(%error, "terminal/create: spawn failed");
+                return Err(JsonRpcError::internal_error(error.to_string()));
+            }
+        };
+        tracing::info!(pid = child.id(), "terminal/create: spawned");
+
+        let id = self.terminals.next.fetch_add(1, Ordering::Relaxed);
+        let terminal_id = format!("terminal-{id}");
+        let terminal = Arc::new(Terminal {
+            retained: Mutex::new(Retained {
+                bytes: Vec::new(),
+                limit: params.output_byte_limit.unwrap_or(TERMINAL_OUTPUT_LIMIT),
+                truncated: false,
+            }),
+            status: Mutex::new(None),
+            exited: Event::new(),
+            pid: child.id(),
+        });
+
+        let mut title = params.command.clone();
+        for arg in &params.args {
+            title.push(' ');
+            title.push_str(arg);
+        }
+        let _ = self
+            .tx
+            .send(AgentEvent::TermStart {
+                terminal_id: terminal_id.clone(),
+                command: format!("$ {title}"),
+            })
+            .await;
+
+        for pipe in [
+            child.stdout.take().map(|pipe| Box::pin(pipe) as _),
+            child.stderr.take().map(|pipe| Box::pin(pipe) as _),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            executor_core::spawn(drain_pipe(
+                pipe,
+                terminal.clone(),
+                terminal_id.clone(),
+                self.tx.clone(),
+            ))
+            .detach();
+        }
+        executor_core::spawn(wait_exit(child, terminal.clone())).detach();
+        self.terminals
+            .map
+            .lock()
+            .unwrap()
+            .insert(terminal_id.clone(), terminal);
+        Ok(TerminalCreateResult {
+            terminal_id,
+            meta: None,
+        })
+    }
+
+    async fn terminal_output(
+        &self,
+        params: TerminalOutputParams,
+    ) -> Result<TerminalOutputResult, JsonRpcError> {
+        let Some(terminal) = self.terminals.get(&params.terminal_id) else {
+            return Err(JsonRpcError::invalid_params("unknown terminal id"));
+        };
+        let retained = terminal.retained.lock().unwrap();
+        Ok(TerminalOutputResult {
+            output: String::from_utf8_lossy(&retained.bytes).into_owned(),
+            truncated: retained.truncated,
+            exit_status: terminal.status.lock().unwrap().clone(),
+            meta: None,
+        })
+    }
+
+    async fn terminal_wait_for_exit(
+        &self,
+        params: TerminalWaitForExitParams,
+    ) -> Result<TerminalExitStatus, JsonRpcError> {
+        let Some(terminal) = self.terminals.get(&params.terminal_id) else {
+            return Err(JsonRpcError::invalid_params("unknown terminal id"));
+        };
+        // Listen before checking so a status written between the two is seen.
+        let listener = terminal.exited.listen();
+        if let Some(status) = terminal.status.lock().unwrap().clone() {
+            return Ok(status);
+        }
+        listener.await;
+        Ok(terminal
+            .status
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("exit notification implies a recorded status"))
+    }
+
+    async fn terminal_kill(
+        &self,
+        params: TerminalKillParams,
+    ) -> Result<TerminalKillResult, JsonRpcError> {
+        let Some(terminal) = self.terminals.get(&params.terminal_id) else {
+            return Err(JsonRpcError::invalid_params("unknown terminal id"));
+        };
+        terminal.kill();
+        Ok(TerminalKillResult { meta: None })
+    }
+
+    async fn terminal_release(
+        &self,
+        params: TerminalReleaseParams,
+    ) -> Result<TerminalReleaseResult, JsonRpcError> {
+        if let Some(terminal) = self.terminals.lock_remove(&params.terminal_id) {
+            terminal.kill();
+        }
+        Ok(TerminalReleaseResult { meta: None })
     }
 
     async fn request_permission(
@@ -96,11 +417,15 @@ impl ClientHandler for Forwarder {
             .or(params.options.first());
         let option_id = option.map_or_else(|| "allow".to_string(), |o| o.option_id.clone());
         let option_name = option.map_or_else(|| "allow".to_string(), |o| o.name.clone());
+        let tool = if params.tool_call.title.is_empty() {
+            &params.tool_call.tool_call_id
+        } else {
+            &params.tool_call.title
+        };
         let _ = self
             .tx
             .send(AgentEvent::Note(format!(
-                "auto-approved `{}` → {option_name}",
-                params.tool_call.title
+                "auto-approved `{tool}` → {option_name}"
             )))
             .await;
         Ok(RequestPermissionResult {
@@ -146,10 +471,44 @@ fn chunk_text(chunk: &aither_acp::ContentChunk) -> &str {
     }
 }
 
-/// Applies one forwarded event to the transcript binding.
-fn apply(lines: &Binding<Vec<Line>>, event: AgentEvent) {
+/// Applies one forwarded event to the transcript binding. `terms` maps
+/// terminal ids to their transcript row so streamed output lands in place.
+fn apply(lines: &Binding<Vec<Line>>, terms: &mut HashMap<String, usize>, event: AgentEvent) {
     match event {
         AgentEvent::Note(note) => push_line(lines, "perm", note),
+        AgentEvent::TermStart {
+            terminal_id,
+            command,
+        } => {
+            // Reserve the output row next to its `$` title so a command that
+            // starts slowly still lands there instead of at the bottom.
+            let mut all = lines.get();
+            all.push(Line {
+                prefix: "tool",
+                text: command,
+                markdown: false,
+            });
+            all.push(Line {
+                prefix: "term",
+                text: String::new(),
+                markdown: false,
+            });
+            terms.insert(terminal_id, all.len() - 1);
+            lines.set(all);
+        }
+        AgentEvent::Term { terminal_id, text } => {
+            let mut all = lines.get();
+            let index = *terms.entry(terminal_id).or_insert_with(|| {
+                all.push(Line {
+                    prefix: "term",
+                    text: String::new(),
+                    markdown: false,
+                });
+                all.len() - 1
+            });
+            all[index].text = text;
+            lines.set(all);
+        }
         AgentEvent::Update(notification) => match notification.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 append_chunk(lines, "devin", true, chunk_text(&chunk));
@@ -161,15 +520,26 @@ fn apply(lines: &Binding<Vec<Line>>, event: AgentEvent) {
                 append_chunk(lines, "you", false, chunk_text(&chunk));
             }
             SessionUpdate::ToolCall(call) => {
-                push_line(lines, "tool", call.title);
+                if call.title.is_empty() {
+                    push_line(lines, "tool", call.tool_call_id);
+                } else {
+                    push_line(lines, "tool", call.title);
+                }
+                render_tool_content(lines, &call.content);
             }
             SessionUpdate::ToolCallUpdate(update) => {
+                if let Some(title) = update.title {
+                    push_line(lines, "tool", title);
+                }
                 if let Some(status) = update.status {
                     push_line(
                         lines,
                         "tool",
                         format!("{} → {status:?}", update.tool_call_id),
                     );
+                }
+                if let Some(content) = &update.content {
+                    render_tool_content(lines, content);
                 }
             }
             SessionUpdate::Plan(plan) => {
@@ -182,13 +552,34 @@ fn apply(lines: &Binding<Vec<Line>>, event: AgentEvent) {
     }
 }
 
+/// Renders the content a tool call reports: text blocks and edited paths.
+/// Terminal content streams separately through `AgentEvent::Term`.
+fn render_tool_content(lines: &Binding<Vec<Line>>, content: &[ToolCallContent]) {
+    for item in content {
+        match item {
+            ToolCallContent::Content {
+                content: ContentBlock::Text(text),
+            } => {
+                let text = text.text.trim_end();
+                if !text.is_empty() {
+                    push_line(lines, "tool", text);
+                }
+            }
+            ToolCallContent::Diff(diff) => {
+                push_line(lines, "tool", format!("edit {}", diff.path.display()));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Role colors for transcript prefixes.
 fn prefix_style(prefix: &str) -> Style {
     let color = |r, g, b| Color::from(ResolvedColor::from_srgb(Srgb::new(r, g, b)));
     match prefix {
         "you" => Style::new().foreground(color(0.42, 0.68, 1.0)),
         "devin" => Style::new().foreground(color(0.55, 0.85, 0.55)),
-        "think" | "tool" | "plan" | "perm" => {
+        "think" | "tool" | "plan" | "perm" | "term" => {
             Style::new().foreground(Color::new(MutedForegroundColor))
         }
         _ => Style::new().foreground(Color::new(MutedForegroundColor)),
@@ -205,6 +596,15 @@ fn render_transcript(lines: &[Line]) -> StyledStr {
             for (text, style) in StyledStr::from_markdown(&line.text).chunks() {
                 out.push(text.clone(), style.clone());
             }
+        } else if line.prefix == "term" && line.text.len() > TERM_DISPLAY_CAP {
+            // Terminal output is unbounded; show the tail, which is where a
+            // running command's live output accumulates.
+            let mut start = line.text.len() - TERM_DISPLAY_CAP;
+            while !line.text.is_char_boundary(start) {
+                start += 1;
+            }
+            out.push_str("…\n");
+            out.push_str(line.text[start..].to_string());
         } else {
             out.push_str(line.text.clone());
         }
@@ -253,7 +653,8 @@ fn app() -> impl View {
     // logs straight over the alternate screen.
     let (program, args) = agent_command();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let client = match spawn_agent(&program, &args, &cwd, tx) {
+    let terminals = Arc::new(Terminals::default());
+    let client = match spawn_agent(&program, &args, &cwd, tx, terminals) {
         Ok((client, connection)) => {
             executor_core::spawn(connection).detach();
             push_line(
@@ -315,8 +716,9 @@ fn app() -> impl View {
         let lines = lines.clone();
         let scroller = scroller.clone();
         async move {
+            let mut terms = HashMap::new();
             while let Ok(event) = rx.recv().await {
-                apply(&lines, event);
+                apply(&lines, &mut terms, event);
                 scroller.scroll_to(Point::new(0.0, f32::MAX));
             }
         }
@@ -419,6 +821,7 @@ fn spawn_agent(
     args: &[String],
     cwd: &std::path::Path,
     tx: async_channel::Sender<AgentEvent>,
+    terminals: Arc<Terminals>,
 ) -> Result<
     (
         AcpClient<Forwarder>,
@@ -450,9 +853,20 @@ fn spawn_agent(
     let child = command.spawn().map_err(|error| error.to_string())?;
     let transport = aither_mcp::transport::ChildProcessTransport::from_child(child)
         .map_err(|error| error.to_string())?;
-    Ok(AcpClient::connect(transport, Forwarder { tx }))
+    Ok(AcpClient::connect(transport, Forwarder { tx, terminals }))
 }
 
 fn main() -> io::Result<()> {
+    // The alternate screen owns the terminal, so diagnostics go to a file.
+    if let Ok(file) = File::create(env::temp_dir().join("waterui-tui-chat-trace.log")) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info,aither=debug".parse().unwrap()),
+            )
+            .with_writer(move || file.try_clone().expect("trace file"))
+            .with_ansi(false)
+            .init();
+    }
     waterui_tui::run(app)
 }

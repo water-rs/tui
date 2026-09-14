@@ -31,13 +31,18 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false }
 base64-simd = "0.8"
 flate2 = "1.1"
-rustix = { version = "1.1.4", features = ["termios"] }
+rustix = { version = "1.1.4", features = ["process", "termios"] }
 
 [dev-dependencies]
 aither-acp = "0.4"
 aither-mcp = "0.4"
 async-channel = "2"
 async-process = "2.5.0"
+event-listener = "5.4.2"
+futures-lite = "2.6.1"
+shell-escape = "0.1"
+strip-ansi-escapes = "0.2.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 waterui-text = { version = "0.4.1", features = ["markdown"] }
 
 # This repository develops against the WaterUI checkout next door; the patch
@@ -45,6 +50,8 @@ waterui-text = { version = "0.4.1", features = ["markdown"] }
 # consumer that pins `waterui-tui` by git supplies its own `[patch]` — the
 # `water` CLI writes one into the generated crate.
 [patch.crates-io]
+aither-acp = { path = "/Users/lexoliu/Coding/aither/acp" }
+aither-mcp = { path = "/Users/lexoliu/Coding/aither/mcp" }
 waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
 waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core" }
 waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
