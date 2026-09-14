@@ -606,3 +606,46 @@ fn gpu_surface_rasterizes_into_half_blocks() {
         "expected red pixel: {r}/{g}/{b}"
     );
 }
+
+#[test]
+fn scroll_shifts_multiline_text_content() {
+    use waterui_layout::scroll::scroll;
+    // A single Text node taller than the viewport: its lines must slide past
+    // the clip, not re-anchor at the visible top.
+    let content: String = (0..30).map(|i| format!("line{i}\n")).collect();
+    let view = scroll(text(Str::from(content)));
+    let mut fixture = Fixture::new(view, 20, 5);
+
+    let out = fixture.draw(20, 5);
+    assert!(out.contains("line0"), "got:\n{out}");
+    assert!(!out.contains("line29"), "got:\n{out}");
+
+    assert!(fixture.root.scroll_at(5, 2, 0, 20));
+    let out = fixture.draw(20, 5);
+    assert!(out.contains("line20"), "after scroll:\n{out}");
+    assert!(
+        !out.contains("line0\n") && !out.lines().next().unwrap().starts_with("line0"),
+        "line0 should be scrolled out:\n{out}"
+    );
+}
+
+#[test]
+fn scroll_controller_pins_to_bottom() {
+    use waterui_layout::scroll::{ScrollController, scroll};
+    let scroller = ScrollController::<waterui_core::layout::Point>::default();
+    let rows: Vec<_> = (0..30)
+        .map(|i| text(Str::from(format!("row{i}"))))
+        .collect();
+    let view = scroll(vstack(rows).spacing(0.0)).scroll_controller(&scroller);
+    let mut fixture = Fixture::new(view, 20, 5);
+
+    let out = fixture.draw(20, 5);
+    assert!(out.contains("row0"), "got:\n{out}");
+
+    scroller.scroll_to(waterui_core::layout::Point::new(0.0, f32::MAX));
+    let out = fixture.draw(20, 5);
+    assert!(
+        out.contains("row29"),
+        "pinned bottom should show row29:\n{out}"
+    );
+}

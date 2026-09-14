@@ -545,7 +545,11 @@ impl Node {
                     &content.get(),
                     alignment.get(),
                     *line_limit,
-                    area,
+                    &TextGeometry {
+                        origin: (fx, fy),
+                        frame_width: frame.width,
+                        clip: area,
+                    },
                     ctx.theme.text(),
                     buf,
                     ctx,
@@ -1375,11 +1379,20 @@ fn measure_text(content: &StyledStr, line_limit: Option<usize>) -> Size {
     Size::new(width as f32, lines as f32 * LINE_HEIGHT)
 }
 
+/// Where a text node's content lives and which cells may receive it.
+/// `origin` is the scroll-shifted content top-left (possibly negative);
+/// `clip` is the intersection of the node frame and the ancestor clip.
+struct TextGeometry {
+    origin: (i32, i32),
+    frame_width: u16,
+    clip: CellRect,
+}
+
 fn draw_text(
     content: &StyledStr,
     alignment: HorizontalAlignment,
     line_limit: Option<usize>,
-    area: CellRect,
+    geo: &TextGeometry,
     base: Style,
     buf: &mut Buffer,
     ctx: &DrawCtx,
@@ -1401,31 +1414,68 @@ fn draw_text(
             }
         }
     }
+    // Lines anchor to the content `origin`, which scroll shifts out from
+    // under `clip` — never to the clipped viewport, or scrolled content would
+    // re-anchor at the window top instead of sliding past it.
+    let clip_top = i32::from(geo.clip.y);
+    let clip_bottom = i32::from(geo.clip.y + geo.clip.height);
+    let clip_left = i32::from(geo.clip.x);
+    let clip_right = i32::from(geo.clip.x + geo.clip.width);
     for (row, line) in lines
         .iter()
         .take(line_limit.unwrap_or(usize::MAX))
         .enumerate()
     {
-        let y = area.y + row as u16;
-        if y >= area.y + area.height {
+        let y = geo.origin.1 + row as i32;
+        if y < clip_top {
+            continue;
+        }
+        if y >= clip_bottom {
             break;
         }
         let width: usize = line.iter().map(|(text, _)| text.width()).sum();
         let mut x = if alignment == HorizontalAlignment::Center {
-            area.x + (area.width as usize).saturating_sub(width) as u16 / 2
+            geo.origin.0 + (i32::from(geo.frame_width) - width as i32).max(0) / 2
         } else if alignment == HorizontalAlignment::Trailing {
-            area.x + area.width.saturating_sub(width as u16)
+            geo.origin.0 + (i32::from(geo.frame_width) - width as i32).max(0)
         } else {
-            area.x
+            geo.origin.0
         };
         for (text, style) in line {
-            let remaining = (area.x + area.width).saturating_sub(x);
-            if remaining == 0 {
-                break;
+            let w = text.width() as i32;
+            let start = x.max(clip_left);
+            let end = (x + w).min(clip_right);
+            if end > start {
+                buf.set_stringn(
+                    start as u16,
+                    y as u16,
+                    drop_cols(text, (start - x) as usize),
+                    (end - start) as usize,
+                    *style,
+                );
             }
-            x = buf.set_stringn(x, y, text, remaining as usize, *style).0;
+            x += w;
         }
     }
+}
+
+/// Drops the first `cols` display columns of `text` — the leading edge of a
+/// line that horizontal scrolling pushed out of the clip. A char wider than
+/// the columns left to drop is removed whole; the gap stays empty.
+fn drop_cols(text: &str, cols: usize) -> &str {
+    if cols == 0 {
+        return text;
+    }
+    let mut dropped = 0;
+    for (index, ch) in text.char_indices() {
+        if dropped >= cols {
+            return &text[index..];
+        }
+        dropped += unicode_width::UnicodeWidthChar::width(ch)
+            .unwrap_or(0)
+            .max(1);
+    }
+    ""
 }
 
 fn draw_button_chrome(
