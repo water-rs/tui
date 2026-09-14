@@ -522,6 +522,7 @@ impl TuiRenderer {
                         offset: Cell::new((0, 0)),
                         extent: Cell::new((0, 0)),
                         requested,
+                        drawn: Cell::new(None),
                     }),
                     env,
                 );
@@ -537,6 +538,7 @@ impl TuiRenderer {
                     offset: Cell::new((0, 0)),
                     extent: Cell::new((0, 0)),
                     requested,
+                    drawn: Cell::new(None),
                 }),
                 env,
             );

@@ -19,6 +19,25 @@
 
 use std::cell::RefCell;
 
+use ratatui::layout::Rect;
+
+/// A vertical shift a scroll view applied between the previously presented
+/// frame and the one being rendered.
+///
+/// Scroll nodes push these into [`crate::node::DrawCtx::scroll_ops`] while
+/// rendering; the presentation step replays each as a hardware scroll-region
+/// command (`DECSTBM` + `SU`/`SD`) plus a matching rotation of the previous
+/// frame buffer, so the cell diff only has to repaint the newly exposed rows
+/// instead of every cell in the viewport.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollOp {
+    /// The viewport band on screen (cell coordinates) whose content shifted.
+    pub region: Rect,
+    /// Offset change since the last presented frame, in cell columns/rows.
+    /// Positive `y` means the view moved down (content moved up).
+    pub delta: (i32, i32),
+}
+
 /// A scroll view's position at the moment [`OnScroll`] fired.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollMetrics {

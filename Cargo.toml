@@ -22,7 +22,7 @@ waterui-shape = "0.1.2"
 nami = "0.11.2"
 executor-core = { version = "0.7.1", features = ["std"] }
 native-executor = "0.8.0"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "scrolling-regions"] }
 crossterm = "0.29"
 unicode-width = "0.2"
 pollster = "1.0"

@@ -1,7 +1,7 @@
 //! Headless render tests: dispatch a view, place it on a fixed cell grid, and
 //! assert on the resulting buffer contents and interaction behavior.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nami::{Binding, SignalExt, binding};
@@ -14,7 +14,7 @@ use waterui_text::styled::StyledStr;
 use waterui_text::text::text;
 use waterui_tui::node::{DrawCtx, screen_points};
 use waterui_tui::style::Theme;
-use waterui_tui::{Node, TuiRenderer, install_terminal_theme};
+use waterui_tui::{Node, ScrollOp, TuiRenderer, install_terminal_theme};
 
 fn buffer_string(buf: &Buffer) -> String {
     let area = buf.area;
@@ -34,6 +34,7 @@ struct Fixture {
     root: Node,
     theme: Theme,
     cursor: Cell<Option<(u16, u16)>>,
+    scroll_ops: RefCell<Vec<ScrollOp>>,
 }
 
 impl Fixture {
@@ -49,6 +50,7 @@ impl Fixture {
             root,
             theme,
             cursor: Cell::new(None),
+            scroll_ops: RefCell::new(Vec::new()),
         };
         fixture.layout(cols, rows);
         fixture
@@ -63,6 +65,7 @@ impl Fixture {
         // (tab switches, scroll extents) are reflected in tests.
         self.layout(cols, rows);
         let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+        self.scroll_ops.borrow_mut().clear();
         self.root.render(
             &mut buf,
             &DrawCtx {
@@ -72,6 +75,7 @@ impl Fixture {
                 cursor: &self.cursor,
                 picker: None,
                 tick: 0,
+                scroll_ops: &self.scroll_ops,
             },
         );
         buf
@@ -202,6 +206,7 @@ fn styled_str_maps_bold_and_color() {
             cursor: &fixture.cursor,
             picker: None,
             tick: 0,
+            scroll_ops: &fixture.scroll_ops,
         },
     );
     let cell = buf.cell((0, 0)).unwrap();
@@ -405,6 +410,13 @@ fn scroll_view_clips_and_wheel_scrolls() {
     let out = fixture.draw(20, 4);
     assert!(out.contains("row2"), "after scroll:\n{out}");
     assert!(!out.contains("row0"), "row0 should be scrolled out:\n{out}");
+
+    // The render reports the offset delta as a ScrollOp so the presentation
+    // step can replay it as a hardware scroll-region command.
+    let ops = fixture.scroll_ops.borrow();
+    assert_eq!(ops.len(), 1, "scroll ops: {ops:?}");
+    assert_eq!(ops[0].region, Rect::new(0, 0, 20, 4));
+    assert_eq!(ops[0].delta, (0, 2));
 }
 
 #[test]
