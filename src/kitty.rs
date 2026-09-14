@@ -117,6 +117,42 @@ impl KittyImage {
         .into_bytes()
     }
 
+    /// The clipped counterpart of [`place`](Self::place): shows only the
+    /// `src` pixel sub-rect of the image, scaled into `cols`×`rows` cells at
+    /// the cursor position. Re-issuing with the same `placement_id` moves or
+    /// re-clips the placement in place.
+    #[must_use]
+    pub fn place_clipped(
+        &self,
+        placement_id: u32,
+        src: (u32, u32, u32, u32),
+        cols: u16,
+        rows: u16,
+        z: i32,
+    ) -> Vec<u8> {
+        let (x, y, w, h) = src;
+        format!(
+            "\x1b_Ga=p,i={},p={placement_id},x={x},y={y},w={w},h={h},c={cols},r={rows},z={z};\x1b\\",
+            self.id
+        )
+        .into_bytes()
+    }
+
+    /// Deletes a single real placement (`a=d,d=p`), leaving the transmitted
+    /// image and its other placements alive.
+    #[must_use]
+    pub fn delete_placement(&self, placement_id: u32) -> Vec<u8> {
+        format!("\x1b_Ga=d,d=p,i={},p={placement_id};\x1b\\", self.id).into_bytes()
+    }
+
+    /// Transmits pixel data without creating any placement (`a=t`). Pair
+    /// with [`place`](Self::place) for z-ordered real placements;
+    /// retransmitting under the same id updates the pixels shown by every
+    /// placement.
+    pub fn store(&self, rgba: &[u8]) -> Vec<u8> {
+        self.encode(rgba, "a=t")
+    }
+
     /// Encodes deletion of the image and all its placements (`a=d`).
     #[must_use]
     pub fn delete(&self) -> Vec<u8> {
@@ -605,6 +641,30 @@ mod tests {
             image.place(3, 20, 8, -1),
             b"\x1b_Ga=p,i=7,p=3,c=20,r=8,z=-1;\x1b\\"
         );
+    }
+
+    #[test]
+    fn place_clipped_carries_source_rect() {
+        let image = KittyImage::new(7, 2, 2);
+        assert_eq!(
+            image.place_clipped(0, (10, 20, 30, 40), 5, 3, -1),
+            b"\x1b_Ga=p,i=7,p=0,x=10,y=20,w=30,h=40,c=5,r=3,z=-1;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn delete_placement_keeps_image_data() {
+        let image = KittyImage::new(7, 2, 2);
+        assert_eq!(image.delete_placement(0), b"\x1b_Ga=d,d=p,i=7,p=0;\x1b\\");
+    }
+
+    #[test]
+    fn store_transmits_without_placement() {
+        let image = KittyImage::new(7, 2, 2);
+        let bytes = image.store(&[0u8, 0, 0, 255].repeat(4));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("a=t"), "got: {text}");
+        assert!(!text.contains("U=1"), "got: {text}");
     }
 
     #[test]
