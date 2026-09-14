@@ -249,7 +249,7 @@ pub enum Kind {
     Gradient(ResolvedGradient),
     /// GPU-rendered content (images, mesh gradients, shader surfaces)
     /// rasterized into the cell grid.
-    Gpu(GpuState),
+    Gpu(Box<GpuState>),
 }
 
 /// A dispatched view: layout leaf, drawable region, and event target.
