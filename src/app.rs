@@ -1,8 +1,9 @@
 //! The terminal event loop.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io::{self, Stdout, stdout};
+use std::mem;
 use std::panic;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,6 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossterm::cursor::Hide;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -19,13 +19,16 @@ use crossterm::terminal::{
 };
 use executor_core::LocalExecutor;
 use executor_core::async_task::{self, AsyncTask, Runnable};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
 use waterui_core::{Environment, View};
 use waterui_internal::app::App;
 
 use crate::node::{DrawCtx, Node, screen_points};
+use crate::present::present;
 use crate::renderer::TuiRenderer;
+use crate::scroll::ScrollOp;
 use crate::style::Theme;
 use crate::theme::install_terminal_theme;
 
@@ -165,6 +168,9 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
     let mut focused = focus_chain.first().copied();
     root.sync_focused(focused);
     let cursor = Cell::new(None);
+    // Scroll deltas discovered during render; `TerminalGuard::draw_frame`
+    // clears and refills it each presented frame.
+    let scroll_ops = RefCell::new(Vec::new());
 
     'app: loop {
         if dirty.get() {
@@ -173,19 +179,14 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
             }
             root.sync_focused(focused);
 
-            let size = guard.terminal.size()?;
+            let size = guard.size()?;
             root.set_frame(screen_points(size.width, size.height));
             let theme = Theme::resolve(&env);
             let tick = renderer.tick();
-            // The diff writer moves the hardware cursor to every run it
-            // prints; with the field cursor left visible those hops flicker
-            // as stray blocks. Hide it for the write — ratatui re-shows it at
-            // the frame's cursor position when it flushes.
-            execute!(stdout(), Hide)?;
-            guard.terminal.draw(|frame| {
+            guard.draw_frame(&scroll_ops, |buf| {
                 cursor.set(None);
                 root.render(
-                    frame.buffer_mut(),
+                    buf,
                     &DrawCtx {
                         env: &env,
                         theme: &theme,
@@ -193,11 +194,10 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
                         cursor: &cursor,
                         picker: picker.as_ref(),
                         tick,
+                        scroll_ops: &scroll_ops,
                     },
                 );
-                if let Some(position) = cursor.get() {
-                    frame.set_cursor_position(position);
-                }
+                cursor.get()
             })?;
 
             for (hook, hook_env) in renderer.take_appear_hooks() {
@@ -377,9 +377,19 @@ impl LocalExecutor for TuiLocalExecutor {
     }
 }
 
-/// Restores the terminal when dropped, including through unwinding.
+/// Owns the terminal for the app's lifetime: raw mode, alternate screen,
+/// mouse capture, and the double buffer every frame is diffed against.
+///
+/// The buffers live here rather than inside ratatui's `Terminal` because the
+/// scroll-region replay must rotate the *previous* buffer before diffing —
+/// `Terminal` never exposes it. Restores the terminal on drop, including
+/// through unwinding.
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    backend: CrosstermBackend<Stdout>,
+    /// What is currently on screen; `present` keeps this true.
+    prev: Buffer,
+    /// The frame being rendered.
+    cur: Buffer,
 }
 
 impl TerminalGuard {
@@ -387,7 +397,8 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut out = stdout();
         execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-        let terminal = Terminal::new(CrosstermBackend::new(out))?;
+        let backend = CrosstermBackend::new(out);
+        let blank = Buffer::empty(Rect::ZERO);
 
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
@@ -396,7 +407,50 @@ impl TerminalGuard {
             previous(info);
         }));
 
-        Ok(Self { terminal })
+        Ok(Self {
+            backend,
+            prev: blank.clone(),
+            cur: blank,
+        })
+    }
+
+    /// The live terminal size; queried per frame so a resize between the
+    /// `Resize` event and the draw is still seen.
+    fn size(&self) -> io::Result<Size> {
+        self.backend.size()
+    }
+
+    /// Renders one frame into `cur`, replays the scroll ops the render
+    /// produced, writes the remaining diff, and swaps the buffers.
+    ///
+    /// The render callback receives the current buffer and returns the field
+    /// cursor position, if a focused field is on screen.
+    fn draw_frame(
+        &mut self,
+        scroll_ops: &RefCell<Vec<ScrollOp>>,
+        render: impl FnOnce(&mut Buffer) -> Option<(u16, u16)>,
+    ) -> io::Result<()> {
+        let size = self.backend.size()?;
+        let resized = size.width != self.cur.area.width || size.height != self.cur.area.height;
+        if resized {
+            let area = Rect::new(0, 0, size.width, size.height);
+            self.prev = Buffer::empty(area);
+            self.cur = Buffer::empty(area);
+            self.backend.clear_region(ClearType::All)?;
+        }
+        self.cur.reset();
+        scroll_ops.borrow_mut().clear();
+        let cursor = render(&mut self.cur);
+        present(
+            &mut self.backend,
+            &mut self.prev,
+            &self.cur,
+            &scroll_ops.borrow(),
+            cursor,
+            resized,
+        )?;
+        mem::swap(&mut self.prev, &mut self.cur);
+        Ok(())
     }
 }
 

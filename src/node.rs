@@ -56,6 +56,9 @@ pub struct DrawCtx<'a> {
     /// Animation frame counter, advanced by the event loop while animated
     /// nodes (spinners) exist.
     pub tick: u64,
+    /// Collects scroll-region deltas discovered while rendering; the
+    /// presentation step replays them as hardware scrolls.
+    pub scroll_ops: &'a RefCell<Vec<crate::scroll::ScrollOp>>,
 }
 
 /// A live editable [`TextField`](waterui_controls::text_field::TextField) node.
@@ -115,6 +118,11 @@ pub struct ScrollState {
     pub extent: Cell<(u16, u16)>,
     /// Programmatic scroll target in cells, set by a `ScrollController` watch.
     pub requested: Rc<Cell<Option<(i32, i32)>>>,
+    /// The offset and on-screen region as last presented. Rendering compares
+    /// the new offset against it and reports the delta as a
+    /// [`crate::scroll::ScrollOp`] so the terminal can hardware-scroll the
+    /// region instead of repainting every cell.
+    pub drawn: Cell<Option<((i32, i32), CellRect)>>,
 }
 
 /// The rendering payload of a node.
@@ -754,6 +762,20 @@ impl Node {
                     self.notify_scroll();
                 }
                 let (ox, oy) = scroll.offset.get();
+                // Report the offset delta to the presentation step — but only
+                // when the node sits in the same spot it was drawn at last
+                // frame; a moved viewport's cells hold unrelated content.
+                if let Some(((dx, dy), region)) = scroll
+                    .drawn
+                    .replace(Some(((ox, oy), area)))
+                    .filter(|(_, region)| *region == area)
+                    && (dx, dy) != (ox, oy)
+                {
+                    ctx.scroll_ops.borrow_mut().push(crate::scroll::ScrollOp {
+                        region,
+                        delta: (ox - dx, oy - dy),
+                    });
+                }
                 let inner = (shift.0 - ox, shift.1 - oy);
                 for child in &self.children {
                     child.render_shifted(buf, ctx, area, inner);
