@@ -9,6 +9,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use waterui_controls::{button, toggle};
 use waterui_core::{Environment, Str, View};
+use waterui_internal::component::link::link;
 use waterui_layout::stack::vstack;
 use waterui_text::styled::StyledStr;
 use waterui_text::text::text;
@@ -35,6 +36,7 @@ struct Fixture {
     theme: Theme,
     cursor: Cell<Option<(u16, u16)>>,
     scroll_ops: RefCell<Vec<ScrollOp>>,
+    links: RefCell<Vec<(Rect, String)>>,
 }
 
 impl Fixture {
@@ -51,6 +53,7 @@ impl Fixture {
             theme,
             cursor: Cell::new(None),
             scroll_ops: RefCell::new(Vec::new()),
+            links: RefCell::new(Vec::new()),
         };
         fixture.layout(cols, rows);
         fixture
@@ -76,6 +79,7 @@ impl Fixture {
                 picker: None,
                 tick: 0,
                 scroll_ops: &self.scroll_ops,
+                links: &self.links,
             },
         );
         buf
@@ -148,6 +152,40 @@ fn button_renders_chrome_and_activates() {
 }
 
 #[test]
+fn pointer_shape_reports_button_and_field() {
+    use waterui_controls::field;
+    let text_value = binding(Str::from_static(""));
+    let view = vstack((
+        text("plain"),
+        button("Bump").action(|| {}),
+        field("Name", &text_value),
+    ))
+    .spacing(0.0);
+    let mut fixture = Fixture::new(view, 40, 5);
+    fixture.draw(40, 5);
+
+    use waterui_tui::PointerShape;
+    // Plain text row: nothing wants a shape there.
+    assert_eq!(fixture.root.pointer_shape_at(0, 0), None);
+    // Scan the middle of every row: the button row holds a hand, the field
+    // row an I-beam.
+    let (mut button_row, mut field_row) = (None, None);
+    for row in 0..5 {
+        match fixture.root.pointer_shape_at(20, row) {
+            Some(PointerShape::Pointer) => button_row = Some(row),
+            Some(PointerShape::Text) => field_row = Some(row),
+            _ => {}
+        }
+    }
+    assert!(
+        button_row.is_some(),
+        "no pointer-shape row under the button"
+    );
+    assert!(field_row.is_some(), "no I-beam row under the field");
+    assert!(button_row < field_row, "button above field");
+}
+
+#[test]
 fn toggle_flips_on_space() {
     let value = binding(false);
     let view = toggle("Enable", &value);
@@ -207,11 +245,26 @@ fn styled_str_maps_bold_and_color() {
             picker: None,
             tick: 0,
             scroll_ops: &fixture.scroll_ops,
+            links: &fixture.links,
         },
     );
     let cell = buf.cell((0, 0)).unwrap();
     assert_eq!(cell.symbol(), "b");
     assert!(cell.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn link_collects_osc8_target() {
+    let mut fixture = Fixture::new(link("docs", "https://developers.cloudflare.com"), 20, 3);
+    let buf = fixture.render_buf(20, 3);
+    assert!(buffer_string(&buf).contains("docs"));
+    let links = fixture.links.borrow();
+    let [(area, url)] = links.as_slice() else {
+        panic!("expected one collected link, got {links:?}")
+    };
+    assert_eq!(url, "https://developers.cloudflare.com");
+    // The collected rect must cover the rendered label.
+    assert!(area.height >= 1 && area.width >= 4);
 }
 
 #[test]

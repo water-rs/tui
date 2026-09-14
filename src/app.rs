@@ -29,8 +29,8 @@ use waterui_core::{Environment, View};
 use waterui_internal::app::App;
 
 use crate::kitty::KittyChannel;
-use crate::node::{DrawCtx, Node, screen_points};
-use crate::present::present;
+use crate::node::{DrawCtx, Node, PointerShape, screen_points};
+use crate::present::{FrameOutput, present};
 use crate::renderer::TuiRenderer;
 use crate::scroll::ScrollOp;
 use crate::style::Theme;
@@ -175,6 +175,7 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
     // Scroll deltas discovered during render; `TerminalGuard::draw_frame`
     // clears and refills it each presented frame.
     let scroll_ops = RefCell::new(Vec::new());
+    let links = RefCell::new(Vec::new());
     // Kitty graphics commands queued by nodes during render — transmissions,
     // placement updates, deletions — drained into each presented frame.
     let kitty = env
@@ -192,7 +193,7 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
             root.set_frame(screen_points(size.width, size.height));
             let theme = Theme::resolve(&env);
             let tick = renderer.tick();
-            guard.draw_frame(&scroll_ops, kitty, |buf| {
+            guard.draw_frame(&scroll_ops, kitty, &links, |buf| {
                 cursor.set(None);
                 root.render(
                     buf,
@@ -204,6 +205,7 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
                         picker: picker.as_ref(),
                         tick,
                         scroll_ops: &scroll_ops,
+                        links: &links,
                     },
                 );
                 cursor.get()
@@ -234,14 +236,28 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
             }
         };
         if let Some(wake) = first
-            && process(wake, &mut root, &mut focus_chain, &mut focused, &dirty)
+            && process(
+                wake,
+                &mut root,
+                &mut focus_chain,
+                &mut focused,
+                &dirty,
+                &mut guard,
+            )
         {
             break 'app;
         }
         // Coalesce everything already queued into this same frame — a wheel
         // burst or a chunk flood becomes one redraw, not one per event.
         while let Ok(wake) = wake_rx.try_recv() {
-            if process(wake, &mut root, &mut focus_chain, &mut focused, &dirty) {
+            if process(
+                wake,
+                &mut root,
+                &mut focus_chain,
+                &mut focused,
+                &dirty,
+                &mut guard,
+            ) {
                 break 'app;
             }
         }
@@ -264,6 +280,7 @@ fn process(
     focus_chain: &mut Vec<u32>,
     focused: &mut Option<u32>,
     dirty: &Cell<bool>,
+    guard: &mut TerminalGuard,
 ) -> bool {
     match wake {
         Wake::Task(runnable) => {
@@ -271,7 +288,7 @@ fn process(
             dirty.set(true);
         }
         Wake::Input(event) => {
-            return handle_input(event, root, focus_chain, focused, dirty);
+            return handle_input(event, root, focus_chain, focused, dirty, guard);
         }
         Wake::InputEof => return true,
     }
@@ -285,6 +302,7 @@ fn handle_input(
     focus_chain: &mut Vec<u32>,
     focused: &mut Option<u32>,
     dirty: &Cell<bool>,
+    guard: &mut TerminalGuard,
 ) -> bool {
     match event {
         // With REPORT_EVENT_TYPES, a held key arrives as Repeat events —
@@ -322,34 +340,42 @@ fn handle_input(
                 }
             }
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(id) = root.mouse(
-                    mouse.column,
-                    mouse.row,
-                    matches!(mouse.kind, MouseEventKind::Drag(_)),
-                ) {
-                    *focused = Some(id);
-                    root.sync_focused(*focused);
-                }
-                dirty.set(true);
-            }
-            MouseEventKind::ScrollDown
-            | MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollRight
-            | MouseEventKind::ScrollLeft => {
-                let (dx, dy) = match mouse.kind {
-                    MouseEventKind::ScrollDown => (0, 1),
-                    MouseEventKind::ScrollUp => (0, -1),
-                    MouseEventKind::ScrollRight => (1, 0),
-                    _ => (-1, 0),
-                };
-                if root.scroll_at(mouse.column, mouse.row, dx, dy) {
+        Event::Mouse(mouse) => {
+            // Pointer shape tracks whatever is under the cursor — moving,
+            // pressing, or content scrolling beneath a stationary pointer all
+            // change the answer, so recompute on every mouse event. A failed
+            // write means the terminal is gone; the reader reports EOF next.
+            let _ = guard.set_pointer_shape(root.pointer_shape_at(mouse.column, mouse.row));
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(id) = root.mouse(
+                        mouse.column,
+                        mouse.row,
+                        matches!(mouse.kind, MouseEventKind::Drag(_)),
+                    ) {
+                        *focused = Some(id);
+                        root.sync_focused(*focused);
+                    }
                     dirty.set(true);
                 }
+                MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollRight
+                | MouseEventKind::ScrollLeft => {
+                    let (dx, dy) = match mouse.kind {
+                        MouseEventKind::ScrollDown => (0, 1),
+                        MouseEventKind::ScrollUp => (0, -1),
+                        MouseEventKind::ScrollRight => (1, 0),
+                        _ => (-1, 0),
+                    };
+                    if root.scroll_at(mouse.column, mouse.row, dx, dy) {
+                        dirty.set(true);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         Event::Resize(..) => dirty.set(true),
         _ => {}
     }
@@ -407,6 +433,8 @@ struct TerminalGuard {
     prev: Buffer,
     /// The frame being rendered.
     cur: Buffer,
+    /// The pointer shape last emitted (`OSC 22`); `None` = terminal default.
+    pointer_shape: Option<PointerShape>,
 }
 
 impl TerminalGuard {
@@ -447,6 +475,7 @@ impl TerminalGuard {
             backend,
             prev: blank.clone(),
             cur: blank,
+            pointer_shape: None,
         })
     }
 
@@ -465,6 +494,7 @@ impl TerminalGuard {
         &mut self,
         scroll_ops: &RefCell<Vec<ScrollOp>>,
         kitty: &KittyChannel,
+        links: &RefCell<Vec<(Rect, String)>>,
         render: impl FnOnce(&mut Buffer) -> Option<(u16, u16)>,
     ) -> io::Result<()> {
         let size = self.backend.size()?;
@@ -477,18 +507,35 @@ impl TerminalGuard {
         }
         self.cur.reset();
         scroll_ops.borrow_mut().clear();
+        links.borrow_mut().clear();
         let cursor = render(&mut self.cur);
         present(
             &mut self.backend,
             &mut self.prev,
             &self.cur,
-            &scroll_ops.borrow(),
-            cursor,
             resized,
-            &kitty.take(),
+            FrameOutput {
+                scroll_ops: &scroll_ops.borrow(),
+                cursor,
+                raw: &kitty.take(),
+                links: &links.borrow(),
+            },
         )?;
         mem::swap(&mut self.prev, &mut self.cur);
         Ok(())
+    }
+
+    /// Emits the kitty pointer-shape escape when the shape changed.
+    /// `None` restores the terminal's default cursor. Terminals without the
+    /// extension ignore the sequence.
+    fn set_pointer_shape(&mut self, shape: Option<PointerShape>) -> io::Result<()> {
+        if shape == self.pointer_shape {
+            return Ok(());
+        }
+        self.pointer_shape = shape;
+        let name = shape.map_or("default", PointerShape::name);
+        write!(self.backend, "\x1b]22;{name}\x1b\\")?;
+        Backend::flush(&mut self.backend)
     }
 
     /// Emits raw escape sequences queued by node drops — image deletions

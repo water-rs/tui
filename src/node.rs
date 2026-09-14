@@ -59,6 +59,9 @@ pub struct DrawCtx<'a> {
     /// Collects scroll-region deltas discovered while rendering; the
     /// presentation step replays them as hardware scrolls.
     pub scroll_ops: &'a RefCell<Vec<crate::scroll::ScrollOp>>,
+    /// Collects `(cell rect, url)` pairs for OSC 8 hyperlink wrapping; the
+    /// presentation step rewrites those rows bracketed in link escapes.
+    pub links: &'a RefCell<Vec<(CellRect, String)>>,
 }
 
 /// A live editable [`TextField`](waterui_controls::text_field::TextField) node.
@@ -123,6 +126,29 @@ pub struct ScrollState {
     /// [`crate::scroll::ScrollOp`] so the terminal can hardware-scroll the
     /// region instead of repainting every cell.
     pub drawn: Cell<Option<((i32, i32), CellRect)>>,
+}
+
+/// The terminal pointer icon a hovered node requests.
+///
+/// Mapped to the kitty pointer-shape escape (`OSC 22`); terminals without
+/// support ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerShape {
+    /// Hand — buttons, links, toggles, tabs, anything activatable.
+    Pointer,
+    /// I-beam — editable text.
+    Text,
+}
+
+impl PointerShape {
+    /// The CSS-style name `OSC 22` carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pointer => "pointer",
+            Self::Text => "text",
+        }
+    }
 }
 
 /// The rendering payload of a node.
@@ -588,6 +614,15 @@ impl Node {
             }
             Kind::Button { style, .. } => {
                 draw_button_chrome(*style, focused, area, buf, ctx);
+                if *style == ButtonStyle::Link
+                    && let Some(target) = self
+                        .env
+                        .get::<waterui_internal::component::link::LinkTarget>()
+                {
+                    ctx.links
+                        .borrow_mut()
+                        .push((area, target.0.get().into_string()));
+                }
             }
             Kind::Toggle { value, style } => {
                 let on = value.get();
@@ -1103,6 +1138,52 @@ impl Node {
                 }
                 false
             }
+        }
+    }
+
+    /// The pointer icon the topmost interactive node under a screen cell
+    /// wants — `None` means the terminal default. Mirrors `scroll_at`'s
+    /// coordinate walk, including scroll offsets.
+    pub fn pointer_shape_at(&self, col: u16, row: u16) -> Option<PointerShape> {
+        self.pointer_shape_at_inner(i32::from(col), i32::from(row))
+    }
+
+    fn pointer_shape_at_inner(&self, col: i32, row: i32) -> Option<PointerShape> {
+        let area = self.frame.get();
+        let inside = i32::from(area.x) <= col
+            && col < i32::from(area.x) + i32::from(area.width)
+            && i32::from(area.y) <= row
+            && row < i32::from(area.y) + i32::from(area.height);
+        if !inside {
+            return None;
+        }
+        let descend = |x: i32, y: i32| -> Option<PointerShape> {
+            for child in self.children.iter().rev() {
+                if let hit @ Some(_) = child.pointer_shape_at_inner(x, y) {
+                    return hit;
+                }
+            }
+            None
+        };
+        match &self.kind {
+            Kind::Scroll(scroll) => {
+                let (ox, oy) = scroll.offset.get();
+                descend(col + ox, row + oy)
+            }
+            Kind::Lazy(state) => state
+                .children
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|child| child.pointer_shape_at_inner(col, row)),
+            Kind::Dynamic(slot) => slot.borrow().pointer_shape_at_inner(col, row),
+            Kind::Field(_) | Kind::Secure(_) => descend(col, row).or(Some(PointerShape::Text)),
+            Kind::Button { .. }
+            | Kind::Toggle { .. }
+            | Kind::Slider { .. }
+            | Kind::Stepper { .. }
+            | Kind::Tabs { .. } => descend(col, row).or(Some(PointerShape::Pointer)),
+            _ => descend(col, row),
         }
     }
 
@@ -1668,6 +1749,7 @@ fn draw_button_chrome(
                 area,
                 Style::default()
                     .fg(ctx.theme.accent)
+                    .underline_color(ctx.theme.accent)
                     .add_modifier(Modifier::UNDERLINED),
             );
         }

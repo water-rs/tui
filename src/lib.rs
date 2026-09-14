@@ -55,7 +55,7 @@ pub mod theme;
 pub mod units;
 
 pub use app::{run, run_app};
-pub use node::Node;
+pub use node::{Node, PointerShape};
 pub use renderer::TuiRenderer;
 pub use scroll::{OnScroll, ScrollMetrics, ScrollOp};
 pub use submit::OnSubmit;
