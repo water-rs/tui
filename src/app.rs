@@ -11,7 +11,10 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -274,37 +277,41 @@ fn handle_input(
     dirty: &Cell<bool>,
 ) -> bool {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Esc => return true,
-            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                return true;
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                focus_chain.clear();
-                root.collect_focus(focus_chain);
-                if !focus_chain.is_empty() {
-                    let next = focused
-                        .and_then(|id| focus_chain.iter().position(|&f| f == id))
-                        .map_or(0, |index| {
-                            if key.code == KeyCode::Tab {
-                                (index + 1) % focus_chain.len()
-                            } else {
-                                (index + focus_chain.len() - 1) % focus_chain.len()
-                            }
-                        });
-                    *focused = Some(focus_chain[next]);
-                    root.sync_focused(*focused);
+        // With REPORT_EVENT_TYPES, a held key arrives as Repeat events —
+        // treat them as presses so editing repeats; Release is ignored.
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            match key.code {
+                KeyCode::Esc => return true,
+                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    return true;
                 }
-                dirty.set(true);
-            }
-            _ => {
-                if let Some(id) = *focused
-                    && root.handle_key(id, &key)
-                {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    focus_chain.clear();
+                    root.collect_focus(focus_chain);
+                    if !focus_chain.is_empty() {
+                        let next = focused
+                            .and_then(|id| focus_chain.iter().position(|&f| f == id))
+                            .map_or(0, |index| {
+                                if key.code == KeyCode::Tab {
+                                    (index + 1) % focus_chain.len()
+                                } else {
+                                    (index + focus_chain.len() - 1) % focus_chain.len()
+                                }
+                            });
+                        *focused = Some(focus_chain[next]);
+                        root.sync_focused(*focused);
+                    }
                     dirty.set(true);
                 }
+                _ => {
+                    if let Some(id) = *focused
+                        && root.handle_key(id, &key)
+                    {
+                        dirty.set(true);
+                    }
+                }
             }
-        },
+        }
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(id) = root.mouse(
@@ -396,14 +403,33 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut out = stdout();
-        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        // Kitty keyboard flags: DISAMBIGUATE makes the Esc key arrive as its
+        // own CSI sequence instead of a bare ESC that collides with Alt- and
+        // in-flight query responses; REPORT_EVENT_TYPES adds repeat/release
+        // events. Terminals without the protocol ignore the push. Deliberately
+        // no REPORT_ALL_KEYS_AS_ESCAPE_CODES: without REPORT_ASSOCIATED_TEXT
+        // (unsupported by crossterm) multi-codepoint input would lose its text.
+        execute!(
+            out,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
         let backend = CrosstermBackend::new(out);
         let blank = Buffer::empty(Rect::ZERO);
 
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(
+                stdout(),
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            );
             previous(info);
         }));
 
@@ -457,6 +483,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            stdout(),
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
     }
 }
