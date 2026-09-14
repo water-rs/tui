@@ -11,28 +11,48 @@
 
 use std::io::Write;
 
-use ratatui::backend::Backend;
+use ratatui::backend::{Backend, IntoCrossterm};
 use ratatui::buffer::{Buffer, Cell};
+use ratatui::crossterm::QueueableCommand;
+use ratatui::crossterm::style::SetStyle;
 use ratatui::layout::Rect;
 
 use crate::scroll::ScrollOp;
+
+/// Everything a render produced besides the cells themselves.
+///
+/// Collected during the frame and handed to [`present`]:
+/// - `scroll_ops` — vertical scroll deltas eligible for hardware-scroll replay
+/// - `cursor` — the focused field's cursor cell, if any
+/// - `raw` — out-of-band escape sequences (kitty transmissions, placements,
+///   deletions). They bypass the cell diff by design: they mutate
+///   terminal-side graphics state, not screen cells
+/// - `links` — `(cell rect, url)` pairs for OSC 8 hyperlinks; the diff already
+///   drew their text, so each row is rewritten once more wrapped in the
+///   escapes — supporting terminals make it clickable, others print identical
+///   glyphs
+#[derive(Default)]
+pub struct FrameOutput<'a> {
+    /// Scroll deltas discovered during render.
+    pub scroll_ops: &'a [ScrollOp],
+    /// Field cursor position in cell coordinates.
+    pub cursor: Option<(u16, u16)>,
+    /// Queued terminal-protocol commands.
+    pub raw: &'a [Vec<u8>],
+    /// Hyperlink regions.
+    pub links: &'a [(Rect, String)],
+}
 
 /// Presents `cur`: replays eligible scroll ops as hardware scrolls, writes the
 /// remaining cell diff, then places the cursor. `resized` means the buffers
 /// were just rebuilt — nothing on screen corresponds to `prev` anymore, so
 /// scroll replay is skipped and the diff repaints everything.
-///
-/// `raw` carries out-of-band escape sequences queued during render — kitty
-/// image transmissions, placements, and deletions. They bypass the cell diff
-/// by design: they mutate terminal-side graphics state, not screen cells.
 pub fn present<B: Backend + Write>(
     backend: &mut B,
     prev: &mut Buffer,
     cur: &Buffer,
-    ops: &[ScrollOp],
-    cursor: Option<(u16, u16)>,
     resized: bool,
-    raw: &[Vec<u8>],
+    frame: FrameOutput<'_>,
 ) -> Result<(), B::Error>
 where
     B::Error: From<std::io::Error>,
@@ -41,17 +61,57 @@ where
     // the field cursor left visible those hops flicker as stray blocks.
     backend.hide_cursor()?;
     if !resized {
-        replay_scroll_ops(backend, prev, ops)?;
+        replay_scroll_ops(backend, prev, frame.scroll_ops)?;
     }
-    for bytes in raw {
+    for bytes in frame.raw {
         backend.write_all(bytes)?;
     }
     backend.draw(prev.diff_iter(cur))?;
-    if let Some(position) = cursor {
+    emit_links(backend, cur, frame.links)?;
+    if let Some(position) = frame.cursor {
         backend.set_cursor_position(position)?;
         backend.show_cursor()?;
     }
     Backend::flush(backend)
+}
+
+/// Rewrites each link row wrapped in OSC 8 escapes. The cell text comes from
+/// `cur` — the frame just presented — so the emitted glyphs match what is on
+/// screen; only the hyperlink attribute is new.
+fn emit_links<B: Backend + Write>(
+    backend: &mut B,
+    cur: &Buffer,
+    links: &[(Rect, String)],
+) -> Result<(), B::Error>
+where
+    B::Error: From<std::io::Error>,
+{
+    let screen = cur.area;
+    for &(rect, ref url) in links {
+        let rect = rect.intersection(screen);
+        for row in rect.top()..rect.bottom() {
+            let mut text = String::with_capacity(usize::from(rect.width) * 2);
+            let mut style = None;
+            for col in rect.left()..rect.right() {
+                if let Some(cell) = cur.cell((col, row)) {
+                    text.push_str(cell.symbol());
+                    if style.is_none() && !cell.symbol().trim().is_empty() {
+                        style = Some(cell.style());
+                    }
+                }
+            }
+            let Some(style) = style else { continue };
+            write!(
+                backend,
+                "\x1b[{};{}H\x1b]8;;{url}\x1b\\\x1b[0m",
+                row + 1,
+                rect.left() + 1,
+            )?;
+            backend.queue(SetStyle(style.into_crossterm()))?;
+            write!(backend, "{text}\x1b]8;;\x1b\\\x1b[0m")?;
+        }
+    }
+    Ok(())
 }
 
 /// Replays each eligible [`ScrollOp`] on the backend and applies the matching
@@ -144,7 +204,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
-    use super::{present, scroll_buffer_region};
+    use super::{FrameOutput, present, scroll_buffer_region};
     use crate::scroll::ScrollOp;
 
     /// A writer shared with the test so emitted ANSI bytes can be inspected;
@@ -242,13 +302,14 @@ mod tests {
             &mut backend,
             &mut prev,
             &cur,
-            &[ScrollOp {
-                region: screen,
-                delta: (0, 1),
-            }],
-            None,
             false,
-            &[],
+            FrameOutput {
+                scroll_ops: &[ScrollOp {
+                    region: screen,
+                    delta: (0, 1),
+                }],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -287,13 +348,14 @@ mod tests {
             &mut backend,
             &mut prev,
             &cur,
-            &[ScrollOp {
-                region: Rect::new(2, 0, 6, 4),
-                delta: (0, 1),
-            }],
-            None,
             false,
-            &[],
+            FrameOutput {
+                scroll_ops: &[ScrollOp {
+                    region: Rect::new(2, 0, 6, 4),
+                    delta: (0, 1),
+                }],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -305,5 +367,45 @@ mod tests {
         );
         // prev untouched — the full diff repaints.
         assert_eq!(row_text(&prev, 0), "00000000");
+    }
+
+    #[test]
+    fn present_wraps_link_rows_in_osc8() {
+        let capture = Capture::default();
+        let mut backend = CrosstermBackend::new(capture.clone());
+        let mut prev = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut cur = Buffer::empty(Rect::new(0, 0, 10, 3));
+        for (i, c) in "docs".chars().enumerate() {
+            cur.cell_mut((i as u16, 1)).unwrap().set_char(c);
+        }
+
+        present(
+            &mut backend,
+            &mut prev,
+            &cur,
+            false,
+            FrameOutput {
+                links: &[(
+                    Rect::new(0, 1, 4, 1),
+                    "https://developers.cloudflare.com".to_string(),
+                )],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let bytes = capture.0.borrow();
+        let out = String::from_utf8_lossy(&bytes);
+        let open = out
+            .find("\u{1b}]8;;https://developers.cloudflare.com\u{1b}\\")
+            .unwrap_or_else(|| panic!("OSC 8 open missing: {out:?}"));
+        let close = out[open..]
+            .find("\u{1b}]8;;\u{1b}\\")
+            .map(|i| open + i)
+            .unwrap_or_else(|| panic!("OSC 8 close missing: {out:?}"));
+        assert!(
+            out[open..close].contains("docs"),
+            "link text must sit inside the wrap: {out:?}"
+        );
     }
 }
