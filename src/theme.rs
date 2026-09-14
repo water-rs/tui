@@ -54,6 +54,10 @@ pub fn install_terminal_theme(env: &mut Environment) {
         ColorScheme::Dark,
     )));
 
+    // Graphics bookkeeping: nodes allocate kitty image ids and queue protocol
+    // bytes here; the event loop drains them into each presented frame.
+    env.insert(crate::kitty::KittyChannel::default());
+
     // Terminals render every face in the same cell grid; the type scale still
     // matters because weight is the one axis a terminal can express.
     env.insert(Store::<Body, _>::new(Computed::constant(Body::DEFAULT)));

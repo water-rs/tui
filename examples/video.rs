@@ -136,7 +136,14 @@ fn main() -> io::Result<()> {
         // Half-block path: two pixel rows per terminal row.
         (u32::from(vw), u32::from(vh) * 2)
     };
+    // VIDEO_PNG=1 switches transmission to PNG (`f=100`) — smaller on the
+    // wire, much slower to encode; useful on bandwidth-bound links.
     let image = KittyImage::new(IMAGE_ID, px_w, px_h);
+    let image = if std::env::var_os("VIDEO_PNG").is_some() {
+        image.png()
+    } else {
+        image
+    };
 
     let mut seek = 0.0;
     let mut decoder = spawn_decoder(&path, px_w, px_h, seek, FPS)?;
@@ -206,7 +213,7 @@ fn main() -> io::Result<()> {
                 Style::default().fg(Color::DarkGray),
             );
             if kitty {
-                draw_placeholders(&image, vw, vh, area, 0, buf);
+                draw_placeholders(&image, vw, vh, area, (0, 0), buf);
             } else if let Some(rgba) = &frame {
                 draw_halfblocks(rgba, px_w, px_h, area, buf);
             }

@@ -9,6 +9,8 @@
 //! scroll could not provide (newly exposed rows, the scrollbar column, and
 //! any content that changed under the scroll).
 
+use std::io::Write;
+
 use ratatui::backend::Backend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
@@ -19,26 +21,37 @@ use crate::scroll::ScrollOp;
 /// remaining cell diff, then places the cursor. `resized` means the buffers
 /// were just rebuilt — nothing on screen corresponds to `prev` anymore, so
 /// scroll replay is skipped and the diff repaints everything.
-pub fn present<B: Backend>(
+///
+/// `raw` carries out-of-band escape sequences queued during render — kitty
+/// image transmissions, placements, and deletions. They bypass the cell diff
+/// by design: they mutate terminal-side graphics state, not screen cells.
+pub fn present<B: Backend + Write>(
     backend: &mut B,
     prev: &mut Buffer,
     cur: &Buffer,
     ops: &[ScrollOp],
     cursor: Option<(u16, u16)>,
     resized: bool,
-) -> Result<(), B::Error> {
+    raw: &[Vec<u8>],
+) -> Result<(), B::Error>
+where
+    B::Error: From<std::io::Error>,
+{
     // The diff writer hops the hardware cursor to every run it prints; with
     // the field cursor left visible those hops flicker as stray blocks.
     backend.hide_cursor()?;
     if !resized {
         replay_scroll_ops(backend, prev, ops)?;
     }
+    for bytes in raw {
+        backend.write_all(bytes)?;
+    }
     backend.draw(prev.diff_iter(cur))?;
     if let Some(position) = cursor {
         backend.set_cursor_position(position)?;
         backend.show_cursor()?;
     }
-    backend.flush()
+    Backend::flush(backend)
 }
 
 /// Replays each eligible [`ScrollOp`] on the backend and applies the matching
@@ -235,6 +248,7 @@ mod tests {
             }],
             None,
             false,
+            &[],
         )
         .unwrap();
 
@@ -279,6 +293,7 @@ mod tests {
             }],
             None,
             false,
+            &[],
         )
         .unwrap();
 

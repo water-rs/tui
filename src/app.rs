@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::io::{self, Stdout, stdout};
+use std::io::{self, Stdout, Write, stdout};
 use std::mem;
 use std::panic;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use ratatui::layout::{Rect, Size};
 use waterui_core::{Environment, View};
 use waterui_internal::app::App;
 
+use crate::kitty::KittyChannel;
 use crate::node::{DrawCtx, Node, screen_points};
 use crate::present::present;
 use crate::renderer::TuiRenderer;
@@ -174,6 +175,11 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
     // Scroll deltas discovered during render; `TerminalGuard::draw_frame`
     // clears and refills it each presented frame.
     let scroll_ops = RefCell::new(Vec::new());
+    // Kitty graphics commands queued by nodes during render — transmissions,
+    // placement updates, deletions — drained into each presented frame.
+    let kitty = env
+        .get::<KittyChannel>()
+        .expect("install_terminal_theme installs KittyChannel");
 
     'app: loop {
         if dirty.get() {
@@ -186,7 +192,7 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
             root.set_frame(screen_points(size.width, size.height));
             let theme = Theme::resolve(&env);
             let tick = renderer.tick();
-            guard.draw_frame(&scroll_ops, |buf| {
+            guard.draw_frame(&scroll_ops, kitty, |buf| {
                 cursor.set(None);
                 root.render(
                     buf,
@@ -243,6 +249,10 @@ fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()>
 
     alive.store(false, Ordering::Relaxed);
     let _ = reader.join();
+    // Node drops may queue image deletions; emit them while the alternate
+    // screen is still up, then let the guard restore the terminal.
+    drop(root);
+    guard.write_raw(&kitty.take())?;
     Ok(())
 }
 
@@ -454,6 +464,7 @@ impl TerminalGuard {
     fn draw_frame(
         &mut self,
         scroll_ops: &RefCell<Vec<ScrollOp>>,
+        kitty: &KittyChannel,
         render: impl FnOnce(&mut Buffer) -> Option<(u16, u16)>,
     ) -> io::Result<()> {
         let size = self.backend.size()?;
@@ -474,9 +485,20 @@ impl TerminalGuard {
             &scroll_ops.borrow(),
             cursor,
             resized,
+            &kitty.take(),
         )?;
         mem::swap(&mut self.prev, &mut self.cur);
         Ok(())
+    }
+
+    /// Emits raw escape sequences queued by node drops — image deletions
+    /// ordered while the tree is torn down still have to reach the terminal
+    /// before the alternate screen is left.
+    fn write_raw(&mut self, bytes: &[Vec<u8>]) -> io::Result<()> {
+        for chunk in bytes {
+            self.backend.write_all(chunk)?;
+        }
+        Backend::flush(&mut self.backend)
     }
 }
 

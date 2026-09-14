@@ -3,9 +3,11 @@
 //!
 //! A `GpuSurface` owns a `GpuView` that only speaks wgpu, so the backend
 //! rasterizes it once into an offscreen `RGBA8` texture through the shared
-//! [`GpuRuntime`]. On terminals with a graphics protocol the pixels are
-//! encoded once into a ratatui-image [`Protocol`] (Kitty, Sixel, or iTerm2)
-//! and drawn as a real image; everywhere else they map onto `▀` half-block
+//! [`GpuRuntime`]. On kitty terminals the pixels are transmitted once onto a
+//! stable image id and bound to the grid with unicode placeholders — resizes
+//! only update the placement, never retransmit pixels, and the node deletes
+//! the image on drop. On Sixel/iTerm2 the raster is encoded through
+//! ratatui-image's [`Protocol`]; everywhere else it maps onto `▀` half-block
 //! cells — each cell shows two vertically stacked source pixels as its fore-
 //! and background colors. The raster happens lazily at the first drawn frame,
 //! when the cell-quantized size is known; later draws resample the cached
@@ -23,7 +25,13 @@ use ratatui_image::{Image, Resize};
 use waterui_core::Environment;
 use waterui_graphics::{GpuRuntime, GpuSurface, OffscreenRenderConfig, OffscreenSize};
 
+use crate::kitty::{KittyChannel, KittyImage, draw_placeholders};
 use crate::style::{Theme, cell_under, composite_rgb8};
+
+/// Largest side of a transmitted raster, in pixels. Fixed-resolution
+/// transmission is what makes terminal resizes free — kitty rescales the
+/// placement, the pixel data never changes.
+const MAX_TRANSMIT_PX: u32 = 1024;
 
 /// One rasterized GPU frame, in `RGBA8` row-major pixels.
 struct Raster {
@@ -34,13 +42,16 @@ struct Raster {
 
 /// A `GpuSurface` node: holds the surface until its first frame is drawn,
 /// then the rasterized pixels. On terminals with a graphics protocol the
-/// pixels are encoded once into a [`Protocol`] and drawn as a real image;
-/// otherwise they map onto `▀` half-block cells.
+/// pixels are drawn as a real image; otherwise they map onto `▀` half-block
+/// cells.
 pub struct GpuState {
     surface: RefCell<Option<GpuSurface>>,
     runtime: Option<GpuRuntime>,
     env: Environment,
     raster: RefCell<Option<Raster>>,
+    /// The transmitted kitty image plus the cell dims its virtual placement
+    /// was last sized to.
+    kitty: RefCell<Option<(KittyImage, (u16, u16))>>,
     protocol: RefCell<Option<Protocol>>,
     failed: Cell<bool>,
 }
@@ -55,6 +66,7 @@ impl GpuState {
             runtime,
             env: env.clone(),
             raster: RefCell::new(None),
+            kitty: RefCell::new(None),
             protocol: RefCell::new(None),
             failed: Cell::new(false),
         }
@@ -88,6 +100,42 @@ impl GpuState {
                 self.failed.set(true);
             }
         }
+    }
+
+    /// Kitty path: transmit the raster once onto a stable image id, then keep
+    /// the virtual placement sized to the current cell frame — a resize sends
+    /// `a=p,U=1` only, never pixels. Placeholders clip and scroll with the
+    /// grid, so partial visibility needs no special casing. Returns `true`
+    /// when the image took over the area.
+    fn draw_kitty(
+        &self,
+        raster: &Raster,
+        size: (u16, u16),
+        area: CellRect,
+        origin: (i32, i32),
+        buf: &mut Buffer,
+    ) -> bool {
+        let Some(channel) = self.env.get::<KittyChannel>() else {
+            return false;
+        };
+        let mut slot = self.kitty.borrow_mut();
+        if let Some((image, cells)) = slot.as_mut() {
+            if *cells != size {
+                channel.send(image.resize_placement(size.0, size.1));
+                *cells = size;
+            }
+        } else {
+            let image = KittyImage::new(channel.alloc(), raster.width, raster.height);
+            channel.send(image.create(&raster.rgba8, size.0, size.1));
+            *slot = Some((image, size));
+        }
+        let (image, _) = slot.as_ref().unwrap();
+        let skipped = (
+            u16::try_from(i32::from(area.left()) - origin.0).unwrap_or(0),
+            u16::try_from(i32::from(area.top()) - origin.1).unwrap_or(0),
+        );
+        draw_placeholders(image, size.0, size.1, area, skipped, buf);
+        true
     }
 
     /// Encodes the raster into a terminal graphics protocol when `picker`
@@ -129,11 +177,11 @@ impl GpuState {
     /// Draws the rasterized pixels (or a placeholder) into the `clip` region
     /// of the frame at signed `origin` with cell `size`.
     ///
-    /// The surface is rasterized at the frame's full size; `clip` only bounds
-    /// which cells are written, so a partially visible image shows a window
-    /// into the full content rather than a rescaled copy. A terminal graphics
-    /// protocol is used only when the whole frame is visible — Sixel and
-    /// iTerm2 cannot clip mid-image.
+    /// The surface is rasterized at a fixed pixel resolution (`MAX_TRANSMIT_PX`
+    /// cap) once; `clip` only bounds which cells are written. On kitty the
+    /// placeholders clip and scroll with the grid at any visibility; on
+    /// Sixel/iTerm2 a real image is used only when the whole frame is visible,
+    /// since those protocols cannot clip mid-image.
     pub fn draw(
         &self,
         origin: (i32, i32),
@@ -150,8 +198,8 @@ impl GpuState {
             Some(picker) => {
                 let font = picker.font_size();
                 (
-                    u32::from(size.0).max(1) * u32::from(font.width),
-                    u32::from(size.1).max(1) * u32::from(font.height),
+                    (u32::from(size.0).max(1) * u32::from(font.width)).min(MAX_TRANSMIT_PX),
+                    (u32::from(size.1).max(1) * u32::from(font.height)).min(MAX_TRANSMIT_PX),
                 )
             }
             None => (u32::from(size.0).max(1), u32::from(size.1).max(1) * 2),
@@ -161,6 +209,13 @@ impl GpuState {
         if raster.is_none() {
             let muted = Style::default().fg(theme.muted);
             buf.set_stringn(clip.x, clip.y, "[gpu]", 5, muted);
+            return;
+        }
+        let raster_ref = raster.as_ref().unwrap();
+        if let Some(picker) = graphics
+            && matches!(picker.protocol_type(), ProtocolType::Kitty)
+            && self.draw_kitty(raster_ref, size, clip, origin, buf)
+        {
             return;
         }
         let frame =
@@ -194,6 +249,19 @@ impl GpuState {
                 let bg = composite_rgb8(r, g, b, a, under);
                 buf.set_stringn(col, row, "▀", 1, Style::default().fg(fg).bg(bg));
             }
+        }
+    }
+}
+
+impl Drop for GpuState {
+    /// Orders deletion of the transmitted kitty image (`a=d`). The bytes go
+    /// through the channel outbox — `Drop` cannot reach the terminal itself,
+    /// so the app loop emits whatever is queued before leaving the screen.
+    fn drop(&mut self) {
+        if let Some((image, _)) = self.kitty.get_mut().take()
+            && let Some(channel) = self.env.get::<KittyChannel>()
+        {
+            channel.send(image.delete());
         }
     }
 }
