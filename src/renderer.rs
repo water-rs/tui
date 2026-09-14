@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use nami::{Computed, Signal};
 use waterui_backend_core::dispatcher::ViewDispatcher;
@@ -78,8 +79,13 @@ pub struct TuiState {
     /// Animation frame counter; the event loop advances it while `animated`
     /// holds so indeterminate progress spinners move.
     pub tick: Cell<u64>,
-    /// Raised when at least one animated node (a `Loading` progress) exists.
-    pub animated: Cell<bool>,
+    /// Number of live animation sources — `Loading` spinners contribute once
+    /// at dispatch; `GpuState` nodes enter and leave as their surface asks for
+    /// frames. The event loop runs an 80 ms frame timer while it is nonzero.
+    pub animated: Rc<Cell<u32>>,
+    /// Wake target handed to `GpuSurface` redraw handles; installed by the
+    /// event loop before dispatch.
+    pub waker: Option<Arc<dyn Fn() + Send + Sync>>,
     next_focus: Cell<u32>,
     appear: Vec<(LifeCycleHook, Environment)>,
     focus_requests: Rc<RefCell<Vec<u32>>>,
@@ -91,7 +97,8 @@ impl Default for TuiState {
         Self {
             dirty: Rc::new(Cell::new(true)),
             tick: Cell::new(0),
-            animated: Cell::new(false),
+            animated: Rc::new(Cell::new(0)),
+            waker: None,
             next_focus: Cell::new(0),
             appear: Vec::new(),
             focus_requests: Rc::new(RefCell::new(Vec::new())),
@@ -226,9 +233,17 @@ impl TuiRenderer {
         self.dispatcher.state_mut().take_focus_requests()
     }
 
-    /// Whether animated nodes (loading spinners) exist.
+    /// Whether animated nodes (loading spinners, animating GPU surfaces)
+    /// exist.
     pub fn animated(&self) -> bool {
-        self.dispatcher.state().animated.get()
+        self.dispatcher.state().animated.get() > 0
+    }
+
+    /// Installs the wake target `GpuSurface` redraw handles call when they
+    /// request a frame between event-loop iterations. Must be set before
+    /// [`Self::dispatch`].
+    pub fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.dispatcher.state_mut().waker = Some(waker);
     }
 
     /// The current animation frame counter.
@@ -329,7 +344,13 @@ impl TuiRenderer {
         d.register::<Native<GpuSurface>>(|state, _ctx, view, env| {
             let stretch = view.stretch_axis();
             let mut node = Node::new(
-                Kind::Gpu(GpuState::new(view.into_inner(), state.gpu(), env)),
+                Kind::Gpu(Box::new(GpuState::new(
+                    view.into_inner(),
+                    state.gpu(),
+                    env,
+                    state.waker.clone(),
+                    state.animated.clone(),
+                ))),
                 env,
             );
             node.stretch = stretch;
@@ -479,7 +500,7 @@ impl TuiRenderer {
             let stretch = view.stretch_axis();
             let config = view.into_inner();
             if matches!(config.style, ProgressStyle::Loading) {
-                state.animated.set(true);
+                state.animated.set(state.animated.get() + 1);
             }
             let mut node = Node::new(
                 Kind::Progress {

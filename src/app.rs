@@ -97,6 +97,8 @@ enum Wake {
     Input(Event),
     /// The reader thread's `event::read` failed — the terminal is gone.
     InputEof,
+    /// A `GpuSurface` redraw handle fired between frames.
+    Repaint,
 }
 
 /// The sender stays with the reader thread; the receiver drives the loop.
@@ -152,6 +154,12 @@ fn spawn_event_reader(tx: mpsc::Sender<Wake>, alive: Arc<AtomicBool>) -> JoinHan
 
 fn run_inner(view: impl View, env: Environment, wake: WakeBus) -> io::Result<()> {
     let mut renderer = TuiRenderer::new();
+    {
+        let tx = wake.tx.clone();
+        renderer.set_waker(Arc::new(move || {
+            let _ = tx.send(Wake::Repaint);
+        }));
+    }
     let dirty = renderer.dirty();
     let mut root = renderer.dispatch(view, &env);
 
@@ -291,6 +299,7 @@ fn process(
             return handle_input(event, root, focus_chain, focused, dirty, guard);
         }
         Wake::InputEof => return true,
+        Wake::Repaint => dirty.set(true),
     }
     false
 }
