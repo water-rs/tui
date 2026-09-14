@@ -8,6 +8,7 @@
 //!
 //! Reference: <https://sw.kovidgoyal.net/kitty/graphics-protocol/>
 
+use std::cell::{Cell as StdCell, RefCell};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::num::NonZeroU16;
@@ -24,6 +25,21 @@ const SKIP: CellDiffOption = CellDiffOption::Skip;
 /// Base64 chars per APC chunk; kitty wants at most 4096.
 const CHUNK_RAW: usize = (4096 / 4) * 3;
 
+/// Pixel encoding used for a [`KittyImage`] transmission.
+///
+/// `Zlib` sends `o=z,f=32` raw RGBA — the default, ~1ms/frame encode.
+/// `Png` sends `f=100` PNG data — ~3–5× smaller on the wire at ~10× the
+/// encode cost, worth it when the pty bandwidth is the bottleneck (SSH,
+/// high-DPI stills) and frame rate is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransmitFormat {
+    /// zlib-compressed RGBA8 (`o=z,f=32`).
+    #[default]
+    Zlib,
+    /// PNG-encoded (`f=100`).
+    Png,
+}
+
 /// One image slot on the terminal, identified by `id`.
 ///
 /// [`create`](Self::create) transmits pixel data with a virtual placement;
@@ -39,16 +55,30 @@ pub struct KittyImage {
     pub width: u32,
     /// Pixel height of the transmitted data.
     pub height: u32,
+    /// Transmission encoding.
+    pub format: TransmitFormat,
 }
 
 impl KittyImage {
-    /// Creates an image slot for `width`×`height` RGBA8 data.
+    /// Creates an image slot for `width`×`height` RGBA8 data, zlib-encoded.
     #[must_use]
     pub const fn new(id: u32, width: u32, height: u32) -> Self {
-        Self { id, width, height }
+        Self {
+            id,
+            width,
+            height,
+            format: TransmitFormat::Zlib,
+        }
     }
 
-    /// Encodes the initial transmission: zlib-compressed RGBA plus a virtual
+    /// The same slot transmitting PNG data instead of zlib RGBA.
+    #[must_use]
+    pub const fn png(mut self) -> Self {
+        self.format = TransmitFormat::Png;
+        self
+    }
+
+    /// Encodes the initial transmission: compressed pixel data plus a virtual
     /// placement (`a=T,U=1`) sized `cols`×`rows` cells — kitty scales the
     /// image into that rectangle wherever placeholder cells for `id` appear.
     /// (z-index does not apply to virtual placements.)
@@ -64,6 +94,29 @@ impl KittyImage {
         self.encode(rgba, &format!("a=T,U=1,c={cols},r={rows}"))
     }
 
+    /// Resizes the virtual placement to `cols`×`rows` cells (`a=p,U=1`)
+    /// without retransmitting a single pixel — the terminal rescales the
+    /// already-transmitted data. This is what makes window resizes free.
+    #[must_use]
+    pub fn resize_placement(&self, cols: u16, rows: u16) -> Vec<u8> {
+        format!("\x1b_Ga=p,U=1,i={},c={cols},r={rows};\x1b\\", self.id).into_bytes()
+    }
+
+    /// Creates a *real* placement (`a=p`) at the current cursor position,
+    /// sized `cols`×`rows` cells. `z` orders it: negative values put the
+    /// image *below* text so cells with a default background show the image
+    /// through — picture-behind-text needs this since z-index does not apply
+    /// to virtual placements. Call more than once with different
+    /// `placement_id`s to place the same transmitted image in several spots.
+    #[must_use]
+    pub fn place(&self, placement_id: u32, cols: u16, rows: u16, z: i32) -> Vec<u8> {
+        format!(
+            "\x1b_Ga=p,i={},p={placement_id},c={cols},r={rows},z={z};\x1b\\",
+            self.id
+        )
+        .into_bytes()
+    }
+
     /// Encodes deletion of the image and all its placements (`a=d`).
     #[must_use]
     pub fn delete(&self) -> Vec<u8> {
@@ -71,15 +124,23 @@ impl KittyImage {
     }
 
     fn encode(&self, rgba: &[u8], action: &str) -> Vec<u8> {
-        let mut compressed = Vec::with_capacity(rgba.len() / 4);
-        ZlibEncoder::new(&mut compressed, Compression::fast())
-            .write_all(rgba)
-            .expect("zlib encoder");
-        let mut out = String::with_capacity(compressed.len() * 4 / 3 + 4096);
+        let (payload, params) = match self.format {
+            TransmitFormat::Zlib => {
+                let mut compressed = Vec::with_capacity(rgba.len() / 4);
+                ZlibEncoder::new(&mut compressed, Compression::fast())
+                    .write_all(rgba)
+                    .expect("zlib encoder");
+                (compressed, "o=z,f=32")
+            }
+            TransmitFormat::Png => (png_encode(rgba, self.width, self.height), "f=100"),
+        };
+        let mut out = String::with_capacity(payload.len() * 4 / 3 + 4096);
         let mut first = true;
-        let count = compressed.len().div_ceil(CHUNK_RAW).max(1);
-        for (i, chunk) in compressed.chunks(CHUNK_RAW).enumerate() {
-            out.push_str("\x1b_Gq=2,o=z,f=32,t=d,");
+        let count = payload.len().div_ceil(CHUNK_RAW).max(1);
+        for (i, chunk) in payload.chunks(CHUNK_RAW).enumerate() {
+            out.push_str("\x1b_Gq=2,t=d,");
+            out.push_str(params);
+            out.push(',');
             write!(out, "i={},", self.id).unwrap();
             if first {
                 write!(out, "{action},s={},v={},", self.width, self.height).unwrap();
@@ -93,21 +154,38 @@ impl KittyImage {
     }
 }
 
+fn png_encode(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut out);
+    image::ImageEncoder::write_image(
+        encoder,
+        rgba,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .expect("png encoder");
+    out
+}
+
 /// Draws `cell_width`×`cell_height` placeholder cells for `image` into the
 /// buffer at `area`, so kitty renders the image exactly there. The cells are
 /// bound to the grid: they scroll and clip like ordinary text.
 ///
-/// `skipped_rows` lifts the top rows out of the image — the caller passes how
-/// many pixel-rows' worth of cells scrolled above the clip.
+/// `skipped` is the number of grid rows/columns scrolled above/left of the
+/// visible area — the placeholder diacritics for those cells are omitted so
+/// the image's hidden slice is not painted over the clip.
 pub fn draw_placeholders(
     image: &KittyImage,
     cell_width: u16,
     cell_height: u16,
     area: Rect,
-    skipped_rows: u16,
+    skipped: (u16, u16),
     buf: &mut Buffer,
 ) {
-    let full_width = area.width.min(cell_width);
+    let (skipped_cols, skipped_rows) = skipped;
+    let max_index = DIACRITICS.len() as u16;
+    let full_width = area.width.min(cell_width.saturating_sub(skipped_cols));
     if full_width == 0 {
         return;
     }
@@ -123,14 +201,14 @@ pub fn draw_placeholders(
     let height = area
         .height
         .min(cell_height)
-        .min(DIACRITICS.len() as u16 - skipped_rows);
+        .min(max_index.saturating_sub(skipped_rows));
     for y in 0..height {
         let mut symbol = String::with_capacity(id_color.len() + full_width as usize * 4 + 40);
         let _ = write!(
             symbol,
             "\x1b[s{id_color}{PLACEHOLDER}{}{}{}",
             diacritic(y + skipped_rows),
-            diacritic(0),
+            diacritic(skipped_cols),
             diacritic(id_extra),
         );
         symbol.push_str(&row_tail);
@@ -144,6 +222,40 @@ pub fn draw_placeholders(
         if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
             cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
         }
+    }
+}
+
+/// Shared kitty graphics bookkeeping for one app run.
+///
+/// Nodes ask it for image ids and push raw escape sequences (transmissions,
+/// placement updates, deletions) into the outbox; the present step drains the
+/// outbox to the terminal writer. This indirection is what lets a node's
+/// `Drop` — which cannot reach the terminal itself — still order an image
+/// deletion, and what keeps every `i=` unique across the tree.
+#[derive(Debug, Default)]
+pub struct KittyChannel {
+    next_id: StdCell<u32>,
+    outbox: RefCell<Vec<Vec<u8>>>,
+}
+
+impl KittyChannel {
+    /// Allocates a fresh kitty image id (`i=`).
+    #[must_use]
+    pub fn alloc(&self) -> u32 {
+        let id = self.next_id.get().max(1);
+        self.next_id.set(id + 1);
+        id
+    }
+
+    /// Queues raw kitty protocol bytes for emission at the next present.
+    pub fn send(&self, bytes: Vec<u8>) {
+        self.outbox.borrow_mut().push(bytes);
+    }
+
+    /// Drains every queued command. Called once per frame by the app loop.
+    #[must_use]
+    pub fn take(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.outbox.borrow_mut())
     }
 }
 
@@ -454,3 +566,79 @@ static DIACRITICS: [char; 297] = [
     '\u{1D243}',
     '\u{1D244}',
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_sends_virtual_placement_with_pixels() {
+        let image = KittyImage::new(7, 2, 2);
+        let bytes = image.create(&[0u8; 16], 4, 3);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.starts_with("\u{1b}_Gq=2,t=d,o=z,f=32,i=7,a=T,U=1,c=4,r=3,s=2,v=2,m=0;"));
+    }
+
+    #[test]
+    fn png_format_sends_f100_without_zlib() {
+        let image = KittyImage::new(7, 2, 2).png();
+        let bytes = image.create(&[255u8; 16], 4, 3);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.contains("f=100"));
+        assert!(!out.contains("o=z"));
+        assert!(out.contains("a=T,U=1,c=4,r=3"));
+    }
+
+    #[test]
+    fn resize_placement_carries_no_pixels() {
+        let image = KittyImage::new(7, 2, 2);
+        assert_eq!(
+            image.resize_placement(10, 5),
+            b"\x1b_Ga=p,U=1,i=7,c=10,r=5;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn place_sets_z_index_and_placement_id() {
+        let image = KittyImage::new(7, 2, 2);
+        assert_eq!(
+            image.place(3, 20, 8, -1),
+            b"\x1b_Ga=p,i=7,p=3,c=20,r=8,z=-1;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn delete_targets_the_id() {
+        assert_eq!(
+            KittyImage::new(42, 1, 1).delete(),
+            b"\x1b_Ga=d,d=I,i=42;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn placeholders_offset_by_scrolled_cells() {
+        let image = KittyImage::new(7, 4, 4);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 10));
+        draw_placeholders(&image, 4, 4, Rect::new(0, 0, 4, 4), (1, 2), &mut buf);
+        let symbol = buf[(0, 0)].symbol();
+        // Row diacritic = skipped 2, column = skipped 1.
+        let expected = format!(
+            "{PLACEHOLDER}{}{}{}",
+            diacritic(2),
+            diacritic(1),
+            diacritic(0)
+        );
+        assert!(symbol.contains(&expected), "{symbol:?}");
+    }
+
+    #[test]
+    fn channel_allocates_ids_and_drains() {
+        let channel = KittyChannel::default();
+        assert_eq!(channel.alloc(), 1);
+        assert_eq!(channel.alloc(), 2);
+        channel.send(vec![1, 2]);
+        channel.send(vec![3]);
+        assert_eq!(channel.take(), vec![vec![1, 2], vec![3]]);
+        assert!(channel.take().is_empty());
+    }
+}

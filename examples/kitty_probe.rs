@@ -55,7 +55,14 @@ fn main() -> io::Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.draw(|f| {
-        draw_placeholders(&image, 40, 10, Rect::new(4, 2, 40, 10), 0, f.buffer_mut());
+        draw_placeholders(
+            &image,
+            40,
+            10,
+            Rect::new(4, 2, 40, 10),
+            (0, 0),
+            f.buffer_mut(),
+        );
     })?;
 
     loop {
