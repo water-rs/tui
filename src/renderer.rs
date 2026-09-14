@@ -29,7 +29,7 @@ use waterui_core::{AnyView, Dynamic, Environment, Metadata, Native, Retain, Str,
 use waterui_form::secure::SecureFieldConfig;
 use waterui_graphics::AppliedFilter;
 use waterui_graphics::color::{Color, ResolvedColor};
-use waterui_graphics::gradient_renderer::ResolvedGradient;
+use waterui_graphics::ResolvedGradient;
 use waterui_graphics::{GpuRuntime, GpuSurface};
 use waterui_icon::SystemIcon;
 use waterui_internal::background::{Background, MaterialBackground};

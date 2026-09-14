@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as CellRect;
 use ratatui::style::{Color, Style};
 use waterui_graphics::color::ResolvedColor;
-use waterui_graphics::gradient_renderer::{GradientType, ResolvedGradient};
+use waterui_graphics::{GradientType, ResolvedGradient};
 
 use crate::style::{cell_under, composite_over};
 

@@ -29,7 +29,7 @@ use waterui_core::views::SharedAnyViews;
 use waterui_core::{AnyView, Environment};
 use waterui_form::secure::Secure;
 use waterui_graphics::color::ResolvedColor;
-use waterui_graphics::gradient_renderer::ResolvedGradient;
+use waterui_graphics::ResolvedGradient;
 use waterui_internal::component::progress::ProgressStyle;
 use waterui_layout::scroll::Axis as ScrollAxis;
 use waterui_text::styled::StyledStr;

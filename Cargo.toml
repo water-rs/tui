@@ -50,16 +50,16 @@ waterui-text = { version = "0.4.1", features = ["markdown"] }
 # consumer that pins `waterui-tui` by git supplies its own `[patch]` — the
 # `water` CLI writes one into the generated crate.
 [patch.crates-io]
-aither-acp = { path = "/Users/lexoliu/Coding/aither/acp" }
-aither-mcp = { path = "/Users/lexoliu/Coding/aither/mcp" }
-waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
-waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core" }
-waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
-waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
-waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
-waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics" }
-waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
-waterui-internal = { path = "/Users/lexoliu/Coding/waterui/src" }
-waterui-form = { path = "/Users/lexoliu/Coding/waterui/components/foundation/form" }
-waterui-navigation = { path = "/Users/lexoliu/Coding/waterui/components/foundation/navigation" }
-waterui-shape = { path = "/Users/lexoliu/Coding/waterui/components/foundation/shape" }
+aither-acp = { path = "../../aither/acp" }
+aither-mcp = { path = "../../aither/mcp" }
+waterui-core = { path = "../../waterui/core" }
+waterui-backend-core = { path = "../../waterui/backends/core" }
+waterui-layout = { path = "../../waterui/components/foundation/layout" }
+waterui-text = { path = "../../waterui/components/foundation/text" }
+waterui-controls = { path = "../../waterui/components/foundation/controls" }
+waterui-graphics = { path = "../../waterui/components/visual/graphics" }
+waterui-icon = { path = "../../waterui/components/foundation/icon" }
+waterui-internal = { path = "../../waterui/src" }
+waterui-form = { path = "../../waterui/components/foundation/form" }
+waterui-navigation = { path = "../../waterui/components/foundation/navigation" }
+waterui-shape = { path = "../../waterui/components/foundation/shape" }
