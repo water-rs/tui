@@ -59,7 +59,7 @@ use waterui_shape::ClipShape;
 use waterui_text::styled::StyledStr;
 use waterui_text::text::TextConfig;
 
-use crate::gpu::GpuState;
+use crate::gpu::{GpuState, ImageUnderlay};
 use crate::node::{FieldState, Kind, LazyState, Node, ScrollState, SecureState, TabEntry};
 use crate::units::{PT_PER_COL, PT_PER_ROW};
 
@@ -620,9 +620,23 @@ impl TuiRenderer {
             let stretch = view.stretch_axis();
             let (layout, contents) = view.into_inner().into_inner();
             let mut node = Node::new(Kind::Container(layout), env);
+            // Z-order: every child but the topmost renders behind later
+            // siblings. Marking them `ImageUnderlay` lets image nodes become
+            // real kitty placements below the text layer — that is what
+            // `background(image)` produces.
+            let last = contents.len().saturating_sub(1);
             node.children = contents
                 .into_iter()
-                .map(|view| ctx.dispatch(view, env))
+                .enumerate()
+                .map(|(i, view)| {
+                    if i < last {
+                        let mut underlay = env.clone();
+                        underlay.insert(ImageUnderlay);
+                        ctx.dispatch(view, &underlay)
+                    } else {
+                        ctx.dispatch(view, env)
+                    }
+                })
                 .collect();
             node.stretch = stretch;
             node

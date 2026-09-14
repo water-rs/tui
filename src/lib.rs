@@ -55,6 +55,7 @@ pub mod theme;
 pub mod units;
 
 pub use app::{run, run_app};
+pub use gpu::ImageUnderlay;
 pub use node::{Node, PointerShape};
 pub use renderer::TuiRenderer;
 pub use scroll::{OnScroll, ScrollMetrics, ScrollOp};

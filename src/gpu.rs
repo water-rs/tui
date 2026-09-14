@@ -48,6 +48,35 @@ struct Raster {
     rgba8: Vec<u8>,
 }
 
+/// Environment marker carried by every non-topmost child of a
+/// `FixedContainer` — i.e. the layers a `background(image)` puts behind its
+/// content. On kitty the image becomes a *real* placement at z-index −1
+/// instead of placeholder cells, so text drawn over it shows the image
+/// through the cells' default background. Other graphics paths ignore the
+/// marker: pixels land in cells and later siblings overwrite them, which
+/// degrades to the same z-order at cell granularity.
+pub struct ImageUnderlay;
+
+/// The transmitted kitty image plus its on-screen placement state.
+struct KittySlot {
+    image: KittyImage,
+    /// The cell dims the virtual placement was last sized to (placeholder
+    /// path).
+    cells: (u16, u16),
+    /// The real placement currently on screen (underlay path): the visible
+    /// cell rectangle and the source pixel rect it shows. `None` while no
+    /// placement exists.
+    placed: Option<Placed>,
+}
+
+/// Signature of a real placement on screen: which cells it occupies and
+/// which sub-rect of the transmitted image those cells show.
+#[derive(Clone, Copy, PartialEq)]
+struct Placed {
+    cells: (u16, u16, u16, u16),
+    src: (u32, u32, u32, u32),
+}
+
 /// A `GpuSurface` node: holds the surface until its first frame is drawn,
 /// then an [`OffscreenSession`] plus the rasterized pixels. On kitty the
 /// session animates — each requested frame re-renders and retransmits onto
@@ -67,9 +96,8 @@ pub struct GpuState {
     animating: Cell<bool>,
     raster: RefCell<Option<Raster>>,
     last_frame: Cell<Option<Instant>>,
-    /// The transmitted kitty image plus the cell dims its virtual placement
-    /// was last sized to.
-    kitty: RefCell<Option<(KittyImage, (u16, u16))>>,
+    /// The transmitted kitty image plus its placement state.
+    kitty: RefCell<Option<KittySlot>>,
     protocol: RefCell<Option<Protocol>>,
     failed: Cell<bool>,
 }
@@ -149,10 +177,14 @@ impl GpuState {
             session.render(delta);
             match pollster::block_on(session.readback_rgba8()) {
                 Ok(output) => {
-                    if let Some((image, cells)) = self.kitty.borrow().as_ref()
+                    if let Some(slot) = self.kitty.borrow().as_ref()
                         && let Some(channel) = self.env.get::<KittyChannel>()
                     {
-                        channel.send(image.frame(&output.rgba8, cells.0, cells.1));
+                        channel.send(if slot.placed.is_some() || self.is_underlay() {
+                            slot.image.store(&output.rgba8)
+                        } else {
+                            slot.image.frame(&output.rgba8, slot.cells.0, slot.cells.1)
+                        });
                     }
                     *self.raster.borrow_mut() = Some(Raster {
                         width: output.width,
@@ -183,11 +215,19 @@ impl GpuState {
         }
     }
 
-    /// Kitty path: transmit the raster once onto a stable image id, then keep
-    /// the virtual placement sized to the current cell frame — a resize sends
-    /// `a=p,U=1` only, never pixels. Placeholders clip and scroll with the
-    /// grid, so partial visibility needs no special casing. Returns `true`
-    /// when the image took over the area.
+    /// Whether this node was dispatched as a non-topmost `FixedContainer`
+    /// child — the background layer a `background(image)` view produces.
+    fn is_underlay(&self) -> bool {
+        self.env.get::<ImageUnderlay>().is_some()
+    }
+
+    /// Kitty path: transmit the raster once onto a stable image id. Ordinary
+    /// images bind to the grid through unicode placeholders — a resize sends
+    /// `a=p,U=1` only, and the cells clip and scroll with the layout. An
+    /// [`ImageUnderlay`] instead becomes a real placement at z-index −1
+    /// below the text layer, re-anchored and re-clipped whenever its
+    /// visible cell rect moves. Returns `true` when the image took over the
+    /// area.
     fn draw_kitty(
         &self,
         raster: &Raster,
@@ -199,24 +239,86 @@ impl GpuState {
         let Some(channel) = self.env.get::<KittyChannel>() else {
             return false;
         };
+        let underlay = self.is_underlay();
         let mut slot = self.kitty.borrow_mut();
-        if let Some((image, cells)) = slot.as_mut() {
-            if *cells != size {
-                channel.send(image.resize_placement(size.0, size.1));
-                *cells = size;
+        match slot.as_mut() {
+            Some(slot) if !underlay && slot.cells != size => {
+                channel.send(slot.image.resize_placement(size.0, size.1));
+                slot.cells = size;
             }
-        } else {
-            let image = KittyImage::new(channel.alloc(), raster.width, raster.height);
-            channel.send(image.create(&raster.rgba8, size.0, size.1));
-            *slot = Some((image, size));
+            None => {
+                let image = KittyImage::new(channel.alloc(), raster.width, raster.height);
+                channel.send(if underlay {
+                    image.store(&raster.rgba8)
+                } else {
+                    image.create(&raster.rgba8, size.0, size.1)
+                });
+                *slot = Some(KittySlot {
+                    image,
+                    cells: size,
+                    placed: None,
+                });
+            }
+            _ => {}
         }
-        let (image, _) = slot.as_ref().unwrap();
-        let skipped = (
-            u16::try_from(i32::from(area.left()) - origin.0).unwrap_or(0),
-            u16::try_from(i32::from(area.top()) - origin.1).unwrap_or(0),
-        );
-        draw_placeholders(image, size.0, size.1, area, skipped, buf);
+        let slot = slot.as_mut().unwrap();
+        if underlay {
+            self.draw_underlay(slot, raster, size, area, origin, channel);
+        } else {
+            let skipped = (
+                u16::try_from(i32::from(area.left()) - origin.0).unwrap_or(0),
+                u16::try_from(i32::from(area.top()) - origin.1).unwrap_or(0),
+            );
+            draw_placeholders(&slot.image, size.0, size.1, area, skipped, buf);
+        }
         true
+    }
+
+    /// Keeps a real kitty placement anchored under the visible part of the
+    /// frame at z-index −1: the image shows through cells with a default
+    /// background, so later siblings' text draws over it. `area` is the
+    /// already-clipped visible rect; the placement's source rect crops the
+    /// image to match, and the bytes move the cursor to `area`'s origin —
+    /// they are emitted before the cell diff, which repositions the cursor
+    /// for its own writes. No cell writes happen here; the image lives
+    /// entirely below the text layer.
+    fn draw_underlay(
+        &self,
+        slot: &mut KittySlot,
+        raster: &Raster,
+        size: (u16, u16),
+        area: CellRect,
+        origin: (i32, i32),
+        channel: &KittyChannel,
+    ) {
+        let placed = (area.width > 0 && area.height > 0).then(|| Placed {
+            cells: (area.x, area.y, area.width, area.height),
+            src: (
+                (i64::from(area.x) - i64::from(origin.0)) as u32 * raster.width
+                    / u32::from(size.0).max(1),
+                (i64::from(area.y) - i64::from(origin.1)) as u32 * raster.height
+                    / u32::from(size.1).max(1),
+                u32::from(area.width) * raster.width / u32::from(size.0).max(1),
+                u32::from(area.height) * raster.height / u32::from(size.1).max(1),
+            ),
+        });
+        if slot.placed == placed {
+            return;
+        }
+        match placed {
+            Some(placed) => {
+                channel.send(format!("\x1b[{};{}H", area.y + 1, area.x + 1).into_bytes());
+                channel.send(slot.image.place_clipped(
+                    0,
+                    placed.src,
+                    placed.cells.2,
+                    placed.cells.3,
+                    -1,
+                ));
+            }
+            None => channel.send(slot.image.delete_placement(0)),
+        }
+        slot.placed = placed;
     }
 
     /// Encodes the raster into a terminal graphics protocol when `picker`
@@ -340,10 +442,10 @@ impl Drop for GpuState {
     /// through the channel outbox — `Drop` cannot reach the terminal itself,
     /// so the app loop emits whatever is queued before leaving the screen.
     fn drop(&mut self) {
-        if let Some((image, _)) = self.kitty.get_mut().take()
+        if let Some(slot) = self.kitty.get_mut().take()
             && let Some(channel) = self.env.get::<KittyChannel>()
         {
-            channel.send(image.delete());
+            channel.send(slot.image.delete());
         }
         if self.animating.get() {
             self.animated.set(self.animated.get() - 1);

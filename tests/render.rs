@@ -286,6 +286,29 @@ fn metadata_environment_passthrough() {
 }
 
 #[test]
+fn background_child_is_marked_as_image_underlay() {
+    use waterui_layout::background;
+    use waterui_tui::ImageUnderlay;
+
+    let fixture = Fixture::new(background(text("fg"), text("bg")), 20, 3);
+    assert_eq!(fixture.root.children.len(), 2);
+    assert!(
+        fixture.root.children[0]
+            .env
+            .get::<ImageUnderlay>()
+            .is_some(),
+        "background layer should carry the underlay marker"
+    );
+    assert!(
+        fixture.root.children[1]
+            .env
+            .get::<ImageUnderlay>()
+            .is_none(),
+        "topmost content must not be marked"
+    );
+}
+
+#[test]
 fn text_field_edits_binding() {
     use waterui_controls::field;
     let value = binding(Str::from_static(""));
