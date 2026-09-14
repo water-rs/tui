@@ -2,18 +2,21 @@
 //! shader surfaces).
 //!
 //! A `GpuSurface` owns a `GpuView` that only speaks wgpu, so the backend
-//! rasterizes it once into an offscreen `RGBA8` texture through the shared
+//! rasterizes it through a persistent [`OffscreenSession`] on the shared
 //! [`GpuRuntime`]. On kitty terminals the pixels are transmitted once onto a
 //! stable image id and bound to the grid with unicode placeholders — resizes
 //! only update the placement, never retransmit pixels, and the node deletes
-//! the image on drop. On Sixel/iTerm2 the raster is encoded through
-//! ratatui-image's [`Protocol`]; everywhere else it maps onto `▀` half-block
-//! cells — each cell shows two vertically stacked source pixels as its fore-
-//! and background colors. The raster happens lazily at the first drawn frame,
-//! when the cell-quantized size is known; later draws resample the cached
-//! pixels, so animated `GpuView`s appear as a still frame.
+//! the image on drop. Animated views re-render while the session reports
+//! `needs_redraw` and retransmit in place onto the same image id; the event
+//! loop's 80 ms frame timer is the throttle. On Sixel/iTerm2 the raster is
+//! encoded through ratatui-image's [`Protocol`] once — those protocols
+//! cannot re-place cheaply, so they keep the first frame; everywhere else
+//! the pixels map onto `▀` half-block cells.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect as CellRect, Size};
@@ -23,7 +26,9 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 use waterui_core::Environment;
-use waterui_graphics::{GpuRuntime, GpuSurface, OffscreenRenderConfig, OffscreenSize};
+use waterui_graphics::{
+    GpuRuntime, GpuSurface, OffscreenRenderConfig, OffscreenSession, OffscreenSize,
+};
 
 use crate::kitty::{KittyChannel, KittyImage, draw_placeholders};
 use crate::style::{Theme, cell_under, composite_rgb8};
@@ -33,6 +38,9 @@ use crate::style::{Theme, cell_under, composite_rgb8};
 /// placement, the pixel data never changes.
 const MAX_TRANSMIT_PX: u32 = 1024;
 
+/// Fallback frame delta reported to the view on its very first render.
+const FIRST_FRAME: Duration = Duration::from_micros(16_667);
+
 /// One rasterized GPU frame, in `RGBA8` row-major pixels.
 struct Raster {
     width: u32,
@@ -41,14 +49,24 @@ struct Raster {
 }
 
 /// A `GpuSurface` node: holds the surface until its first frame is drawn,
-/// then the rasterized pixels. On terminals with a graphics protocol the
-/// pixels are drawn as a real image; otherwise they map onto `▀` half-block
-/// cells.
+/// then an [`OffscreenSession`] plus the rasterized pixels. On kitty the
+/// session animates — each requested frame re-renders and retransmits onto
+/// the same image id; on other protocols the first frame is a static
+/// snapshot; without a graphics protocol the pixels map onto `▀` cells.
 pub struct GpuState {
     surface: RefCell<Option<GpuSurface>>,
+    session: RefCell<Option<OffscreenSession>>,
     runtime: Option<GpuRuntime>,
     env: Environment,
+    /// Wake target installed on the session's `RedrawHandle` so the view can
+    /// request frames between event-loop iterations.
+    waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Shared animation-source counter; `animating` tracks this node's own
+    /// contribution so several sources can hold the frame timer at once.
+    animated: Rc<Cell<u32>>,
+    animating: Cell<bool>,
     raster: RefCell<Option<Raster>>,
+    last_frame: Cell<Option<Instant>>,
     /// The transmitted kitty image plus the cell dims its virtual placement
     /// was last sized to.
     kitty: RefCell<Option<(KittyImage, (u16, u16))>>,
@@ -60,21 +78,33 @@ impl GpuState {
     /// Creates GPU-backed state for `surface`. `runtime` is `None` when the
     /// terminal host has no usable GPU adapter; the node then draws a
     /// placeholder marker.
-    pub fn new(surface: GpuSurface, runtime: Option<GpuRuntime>, env: &Environment) -> Self {
+    pub fn new(
+        surface: GpuSurface,
+        runtime: Option<GpuRuntime>,
+        env: &Environment,
+        waker: Option<Arc<dyn Fn() + Send + Sync>>,
+        animated: Rc<Cell<u32>>,
+    ) -> Self {
         Self {
             surface: RefCell::new(Some(surface)),
+            session: RefCell::new(None),
             runtime,
             env: env.clone(),
+            waker,
+            animated,
+            animating: Cell::new(false),
             raster: RefCell::new(None),
+            last_frame: Cell::new(None),
             kitty: RefCell::new(None),
             protocol: RefCell::new(None),
             failed: Cell::new(false),
         }
     }
 
-    /// Rasterizes the surface once at the current cell size.
-    fn rasterize(&self, cols: u32, sub_rows: u32) {
-        if self.raster.borrow().is_some() || self.failed.get() {
+    /// Starts the offscreen session on first draw, installs the wake target
+    /// on its redraw handle, and renders the pending first frame.
+    fn ensure_session(&self, cols: u32, sub_rows: u32) {
+        if self.session.borrow().is_some() || self.failed.get() {
             return;
         }
         let (Some(runtime), Some(surface)) =
@@ -87,18 +117,69 @@ impl GpuState {
             .expect("raster target is clamped to be non-empty");
         let config = OffscreenRenderConfig::new(size);
         let mut env = self.env.clone();
-        match pollster::block_on(surface.render_offscreen(runtime, config, &mut env)) {
-            Ok(output) => {
-                *self.raster.borrow_mut() = Some(Raster {
-                    width: output.width,
-                    height: output.height,
-                    rgba8: output.rgba8,
-                });
+        match pollster::block_on(surface.start_offscreen(runtime, config, &mut env)) {
+            Ok(session) => {
+                if let Some(waker) = &self.waker {
+                    session.redraw_handle().set_waker(Some(Arc::clone(waker)));
+                }
+                *self.session.borrow_mut() = Some(session);
             }
             Err(error) => {
-                tracing::warn!("offscreen GPU rasterization failed: {error}");
+                tracing::warn!("offscreen GPU session failed to start: {error}");
                 self.failed.set(true);
             }
+        }
+    }
+
+    /// Renders one frame into the raster when the session asks for it, and
+    /// retransmits onto the live kitty image. Animation only runs on kitty —
+    /// the other paths keep their first frame.
+    fn pump(&self) {
+        if self.env.get::<KittyChannel>().is_none() {
+            return;
+        }
+        let mut slot = self.session.borrow_mut();
+        let Some(session) = slot.as_mut() else { return };
+        if session.needs_redraw() {
+            let now = Instant::now();
+            let delta = self
+                .last_frame
+                .replace(Some(now))
+                .map_or(FIRST_FRAME, |last| now - last);
+            session.render(delta);
+            match pollster::block_on(session.readback_rgba8()) {
+                Ok(output) => {
+                    if let Some((image, cells)) = self.kitty.borrow().as_ref()
+                        && let Some(channel) = self.env.get::<KittyChannel>()
+                    {
+                        channel.send(image.frame(&output.rgba8, cells.0, cells.1));
+                    }
+                    *self.raster.borrow_mut() = Some(Raster {
+                        width: output.width,
+                        height: output.height,
+                        rgba8: output.rgba8,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!("offscreen GPU readback failed: {error}");
+                    self.failed.set(true);
+                }
+            }
+        }
+        // The session keeps the loop's frame timer alive while the view asks
+        // for frames; once it settles, release this node's contribution so the
+        // loop can sleep again.
+        let wants = session.needs_redraw();
+        match (self.animating.get(), wants) {
+            (false, true) => {
+                self.animating.set(true);
+                self.animated.set(self.animated.get() + 1);
+            }
+            (true, false) => {
+                self.animating.set(false);
+                self.animated.set(self.animated.get() - 1);
+            }
+            _ => {}
         }
     }
 
@@ -178,7 +259,7 @@ impl GpuState {
     /// of the frame at signed `origin` with cell `size`.
     ///
     /// The surface is rasterized at a fixed pixel resolution (`MAX_TRANSMIT_PX`
-    /// cap) once; `clip` only bounds which cells are written. On kitty the
+    /// cap); `clip` only bounds which cells are written. On kitty the
     /// placeholders clip and scroll with the grid at any visibility; on
     /// Sixel/iTerm2 a real image is used only when the whole frame is visible,
     /// since those protocols cannot clip mid-image.
@@ -204,7 +285,8 @@ impl GpuState {
             }
             None => (u32::from(size.0).max(1), u32::from(size.1).max(1) * 2),
         };
-        self.rasterize(width, height);
+        self.ensure_session(width, height);
+        self.pump();
         let raster = self.raster.borrow();
         if raster.is_none() {
             let muted = Style::default().fg(theme.muted);
@@ -262,6 +344,9 @@ impl Drop for GpuState {
             && let Some(channel) = self.env.get::<KittyChannel>()
         {
             channel.send(image.delete());
+        }
+        if self.animating.get() {
+            self.animated.set(self.animated.get() - 1);
         }
     }
 }
