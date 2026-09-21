@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The floor is whatever `Cargo.toml` declares, read here rather than
+      # written twice: a hardcoded version in CI drifts from the manifest and
+      # then gates a number nobody declared.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Installing a toolchain is not building with it: the action only
+          # sets the rustup default, and this repository's
+          # `rust-toolchain.toml` overrides the default for every cargo
+          # invocation inside the checkout. `RUSTUP_TOOLCHAIN` is the one
+          # override that beats the file.
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+      # Resolution has to traverse `[patch.crates-io]`, which names sibling
+      # checkouts of waterui and aither by developer-machine paths. waterui is
+      # pinned to the commit whose in-tree crate versions satisfy this
+      # crate's requirements: cargo rejects a patch whose version does not
+      # match, so the pin moves whenever the declared requirements move.
+      # `submodules` is required — the waterui workspace resolves `utils/nami`
+      # and `kit/*` path dependencies.
+      - uses: actions/checkout@v4
+        with:
+          repository: water-rs/waterui
+          ref: 466e52988f06ea8d5d59f934aec21e75b18ed4f2
+          path: deps/waterui
+          submodules: true
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          ref: 8381874f1cd32d41c4898887bfcbf0287dee5fda
+          path: deps/aither
+      - name: Repoint the patch table at the sibling checkouts
+        run: sed -i 's|/Users/lexoliu/Coding/|deps/|g' Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Proof in the log that the floor is what compiled, so a later change to
+      # the pin or the action cannot quietly make this a second stable run.
+      - name: Show the toolchain this job builds with
+        run: rustc --version && cargo --version
+      # The shipped artifact is what MSRV bounds: dev-dependencies may
+      # legitimately require newer, so check the package targets only. The
+      # lockfile is gitignored, so there is no `--locked` to pass.
+      - run: cargo check
