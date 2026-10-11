@@ -1,6 +1,6 @@
 //! Terminal theme: installs WaterUI's theme slots into an [`Environment`].
 //!
-//! Components resolve colors through `Store<SomeColor, Computed<ResolvedColor>>`
+//! Components resolve colors through `Store<SomeColor, Computed<WorkingColor>>`
 //! and fonts through `Store<SomeFontSlot, Computed<ResolvedFont>>`. The terminal
 //! has no system palette to bridge, so this module installs a fixed dark
 //! palette mapped from the usual WaterUI defaults; applications can install a
@@ -12,18 +12,21 @@ use waterui_core::Environment;
 use waterui_core::env::Store;
 use waterui_graphics::color::{
     AccentColor, AccentContainerColor, AccentForegroundColor, BackgroundColor, BorderColor,
-    ColorScheme, ForegroundColor, MutedForegroundColor, ResolvedColor, SelectionContainerColor,
+    ColorScheme, ForegroundColor, MutedForegroundColor, SelectionContainerColor,
     SelectionForegroundColor, Srgb, SurfaceColor, SurfaceVariantColor, TertiaryColor,
-    TertiaryContainerColor,
+    TertiaryContainerColor, WorkingColor,
 };
 use waterui_text::font::{Body, Caption, FontSlot, Footnote, Headline, Subheadline, Title};
 
-fn color(red: u8, green: u8, blue: u8) -> Computed<ResolvedColor> {
-    Computed::constant(ResolvedColor::from_srgb(Srgb::new(
-        f32::from(red) / 255.0,
-        f32::from(green) / 255.0,
-        f32::from(blue) / 255.0,
-    )))
+fn color(red: u8, green: u8, blue: u8) -> Computed<WorkingColor> {
+    Computed::constant(
+        Srgb::new(
+            f32::from(red) / 255.0,
+            f32::from(green) / 255.0,
+            f32::from(blue) / 255.0,
+        )
+        .resolve(),
+    )
 }
 
 /// Installs the default terminal palette and font slots into `env`.

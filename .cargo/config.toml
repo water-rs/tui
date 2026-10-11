@@ -1,0 +1,5 @@
+[env]
+# The patched waterui checkout builds cherenkov-gpu, whose native Apple
+# contract (graphics/cherenkov/docs/api.md) requires OS 26 APIs.
+MACOSX_DEPLOYMENT_TARGET = "26.0"
+IPHONEOS_DEPLOYMENT_TARGET = "26.0"

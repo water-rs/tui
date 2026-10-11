@@ -1,22 +1,26 @@
-//! Terminal rendering of `GpuSurface` content (images, mesh gradients,
-//! shader surfaces).
+//! Terminal rendering of GPU and scene content (images, mesh gradients,
+//! shader surfaces, canvases).
 //!
-//! A `GpuSurface` owns a `GpuView` that only speaks wgpu, so the backend
-//! rasterizes it through a persistent [`OffscreenSession`] on the shared
-//! [`GpuRuntime`]. On kitty terminals the pixels are transmitted once onto a
-//! stable image id and bound to the grid with unicode placeholders — resizes
-//! only update the placement, never retransmit pixels, and the node deletes
-//! the image on drop. Animated views re-render while the session reports
-//! `needs_redraw` and retransmit in place onto the same image id; the event
-//! loop's 80 ms frame timer is the throttle. On Sixel/iTerm2 the raster is
-//! encoded through ratatui-image's [`Protocol`] once — those protocols
-//! cannot re-place cheaply, so they keep the first frame; everywhere else
-//! the pixels map onto `▀` half-block cells.
+//! `GpuContentView` content only speaks wgpu, so the backend rasterizes it
+//! through a persistent [`GpuContentRenderer`] on the shared [`GpuRuntime`]
+//! and copies the presented texture back each frame. `SceneView` content
+//! records into a Cherenkov engine, so it renders through a CPU
+//! [`OffscreenRenderer`] — the same raster feeds every terminal path either
+//! way. On kitty terminals the pixels are transmitted once onto a stable
+//! image id and bound to the grid with unicode placeholders — resizes only
+//! update the placement, never retransmit pixels, and the node deletes the
+//! image on drop. Animated content re-renders while it asks for frames —
+//! the engine's `Next`, a `RedrawHandle` request, or a scene invalidation —
+//! and retransmits in place onto the same image id; the event loop's 80 ms
+//! frame timer is the throttle. On Sixel/iTerm2 the raster is encoded
+//! through ratatui-image's [`Protocol`] once — those protocols cannot
+//! re-place cheaply, so they keep the first frame; everywhere else the
+//! pixels map onto `▀` half-block cells.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect as CellRect, Size};
@@ -26,8 +30,12 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 use waterui_core::Environment;
+use waterui_graphics::cherenkov::{Display, FrameTime, Next};
+use waterui_graphics::cherenkov_cpu::Raster;
+use waterui_graphics::gpu::GpuContentRenderer;
+use waterui_graphics::wgpu;
 use waterui_graphics::{
-    GpuRuntime, GpuSurface, OffscreenRenderConfig, OffscreenSession, OffscreenSize,
+    GpuContentView, GpuRuntime, OffscreenRenderer, OffscreenSize, RedrawHandle, SceneView,
 };
 
 use crate::kitty::{KittyChannel, KittyImage, draw_placeholders};
@@ -38,11 +46,11 @@ use crate::style::{Theme, cell_under, composite_rgb8};
 /// placement, the pixel data never changes.
 const MAX_TRANSMIT_PX: u32 = 1024;
 
-/// Fallback frame delta reported to the view on its very first render.
-const FIRST_FRAME: Duration = Duration::from_micros(16_667);
+/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`; the name is not re-exported.
+const ROW_ALIGNMENT: u32 = 256;
 
-/// One rasterized GPU frame, in `RGBA8` row-major pixels.
-struct Raster {
+/// One rasterized frame, in `RGBA8` row-major pixels.
+struct Raster8 {
     width: u32,
     height: u32,
     rgba8: Vec<u8>,
@@ -77,25 +85,60 @@ struct Placed {
     src: (u32, u32, u32, u32),
 }
 
-/// A `GpuSurface` node: holds the surface until its first frame is drawn,
-/// then an [`OffscreenSession`] plus the rasterized pixels. On kitty the
-/// session animates — each requested frame re-renders and retransmits onto
-/// the same image id; on other protocols the first frame is a static
-/// snapshot; without a graphics protocol the pixels map onto `▀` cells.
+/// The leaf waiting for its first frame.
+enum Pending {
+    Gpu(GpuContentView),
+    Scene(SceneView),
+}
+
+/// A retained `GpuContentView` renderer presenting into an owned texture.
+struct GpuSession {
+    view: GpuContentView,
+    renderer: GpuContentRenderer,
+    /// Target `present` draws into and `readback_frame` copies out.
+    texture: wgpu::Texture,
+    /// Staging buffer for the readback.
+    buffer: wgpu::Buffer,
+    /// `buffer`'s bytes per row, 256-aligned.
+    stride: u32,
+}
+
+/// The retained renderer installed by the first draw.
+enum Session {
+    /// `GpuContentView` content presented into an owned texture.
+    Gpu(Box<GpuSession>),
+    /// `SceneView` content rendered by the CPU raster engine.
+    Scene {
+        view: SceneView,
+        renderer: OffscreenRenderer<Raster>,
+        /// The pixel target `render` draws into and reads back.
+        size: OffscreenSize,
+    },
+}
+
+/// A GPU/scene node: holds the leaf until its first frame is drawn, then
+/// the retained renderer plus the rasterized pixels. On kitty the session
+/// animates — each requested frame re-renders and retransmits onto the same
+/// image id; on other protocols the first frame is a static snapshot;
+/// without a graphics protocol the pixels map onto `▀` cells.
 pub struct GpuState {
-    surface: RefCell<Option<GpuSurface>>,
-    session: RefCell<Option<OffscreenSession>>,
+    pending: RefCell<Option<Pending>>,
+    session: RefCell<Option<Session>>,
     runtime: Option<GpuRuntime>,
     env: Environment,
-    /// Wake target installed on the session's `RedrawHandle` so the view can
-    /// request frames between event-loop iterations.
+    /// Wake target handed to the app so redraw requests from another thread
+    /// reach the event loop between frames.
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Set by the `RedrawHandle`/scene invalidator when content asks for a
+    /// frame; consumed by `pump`.
+    requested: Arc<AtomicBool>,
+    /// The engine's answer for when the content next needs a frame.
+    next: RefCell<Next>,
     /// Shared animation-source counter; `animating` tracks this node's own
     /// contribution so several sources can hold the frame timer at once.
     animated: Rc<Cell<u32>>,
     animating: Cell<bool>,
-    raster: RefCell<Option<Raster>>,
-    last_frame: Cell<Option<Instant>>,
+    raster: RefCell<Option<Raster8>>,
     /// The transmitted kitty image plus its placement state.
     kitty: RefCell<Option<KittySlot>>,
     protocol: RefCell<Option<Protocol>>,
@@ -103,105 +146,194 @@ pub struct GpuState {
 }
 
 impl GpuState {
-    /// Creates GPU-backed state for `surface`. `runtime` is `None` when the
-    /// terminal host has no usable GPU adapter; the node then draws a
-    /// placeholder marker.
+    /// Creates GPU-backed state for a `GpuContentView`. `runtime` is `None`
+    /// when the terminal host has no usable GPU adapter; the node then draws
+    /// a placeholder marker.
     pub fn new(
-        surface: GpuSurface,
+        view: GpuContentView,
+        runtime: Option<GpuRuntime>,
+        env: &Environment,
+        waker: Option<Arc<dyn Fn() + Send + Sync>>,
+        animated: Rc<Cell<u32>>,
+    ) -> Self {
+        Self::pending(Pending::Gpu(view), runtime, env, waker, animated)
+    }
+
+    /// Creates raster state for a `SceneView`; the CPU raster engine needs
+    /// no GPU adapter.
+    pub fn scene(
+        view: SceneView,
+        env: &Environment,
+        waker: Option<Arc<dyn Fn() + Send + Sync>>,
+        animated: Rc<Cell<u32>>,
+    ) -> Self {
+        Self::pending(Pending::Scene(view), None, env, waker, animated)
+    }
+
+    fn pending(
+        pending: Pending,
         runtime: Option<GpuRuntime>,
         env: &Environment,
         waker: Option<Arc<dyn Fn() + Send + Sync>>,
         animated: Rc<Cell<u32>>,
     ) -> Self {
         Self {
-            surface: RefCell::new(Some(surface)),
+            pending: RefCell::new(Some(pending)),
             session: RefCell::new(None),
             runtime,
             env: env.clone(),
             waker,
+            requested: Arc::new(AtomicBool::new(false)),
+            next: RefCell::new(Next::Idle),
             animated,
             animating: Cell::new(false),
             raster: RefCell::new(None),
-            last_frame: Cell::new(None),
             kitty: RefCell::new(None),
             protocol: RefCell::new(None),
             failed: Cell::new(false),
         }
     }
 
-    /// Starts the offscreen session on first draw, installs the wake target
-    /// on its redraw handle, and renders the pending first frame.
+    /// The `RedrawHandle`/invalidator that wakes this node and the app's
+    /// event loop when content asks for a frame.
+    fn wake(&self) -> impl Fn() + Send + Sync + 'static {
+        let requested = Arc::clone(&self.requested);
+        let waker = self.waker.clone();
+        move || {
+            requested.store(true, Ordering::Release);
+            if let Some(waker) = &waker {
+                waker();
+            }
+        }
+    }
+
+    /// Installs the renderer on first draw and queues the first frame.
     fn ensure_session(&self, cols: u32, sub_rows: u32) {
         if self.session.borrow().is_some() || self.failed.get() {
             return;
         }
-        let (Some(runtime), Some(surface)) =
-            (self.runtime.as_ref(), self.surface.borrow_mut().take())
-        else {
+        let Some(pending) = self.pending.borrow_mut().take() else {
             self.failed.set(true);
             return;
         };
         let size = OffscreenSize::try_from_pixels(cols, sub_rows)
             .expect("raster target is clamped to be non-empty");
-        let config = OffscreenRenderConfig::new(size);
-        let mut env = self.env.clone();
-        match pollster::block_on(surface.start_offscreen(runtime, config, &mut env)) {
-            Ok(session) => {
-                if let Some(waker) = &self.waker {
-                    session.redraw_handle().set_waker(Some(Arc::clone(waker)));
+        match pending {
+            Pending::Gpu(mut view) => {
+                let Some(runtime) = self.runtime.as_ref() else {
+                    self.failed.set(true);
+                    return;
+                };
+                let content = view.take_engine_content();
+                let (texture, buffer, stride) = readback_target(runtime, size);
+                match GpuContentRenderer::new(
+                    runtime,
+                    runtime.context(),
+                    content,
+                    size,
+                    RedrawHandle::new(self.wake()),
+                ) {
+                    Ok(renderer) => {
+                        *self.session.borrow_mut() = Some(Session::Gpu(Box::new(GpuSession {
+                            view,
+                            renderer,
+                            texture,
+                            buffer,
+                            stride,
+                        })));
+                    }
+                    Err(error) => {
+                        tracing::warn!("GPU content renderer failed to start: {error}");
+                        self.failed.set(true);
+                    }
                 }
-                *self.session.borrow_mut() = Some(session);
             }
-            Err(error) => {
-                tracing::warn!("offscreen GPU session failed to start: {error}");
-                self.failed.set(true);
-            }
+            Pending::Scene(view) => match OffscreenRenderer::<Raster>::cpu() {
+                Ok(renderer) => {
+                    let mut view = view;
+                    view.content_mut()
+                        .set_invalidator(Some(Rc::new(self.wake())));
+                    *self.session.borrow_mut() = Some(Session::Scene {
+                        view,
+                        renderer,
+                        size,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!("scene offscreen renderer failed to start: {error}");
+                    self.failed.set(true);
+                }
+            },
         }
     }
 
-    /// Renders one frame into the raster when the session asks for it, and
-    /// retransmits onto the live kitty image. Animation only runs on kitty —
-    /// the other paths keep their first frame.
+    /// Renders the next frame into the raster when the session asks for it,
+    /// and retransmits onto the live kitty image. Animation only runs on
+    /// kitty — the other paths keep their first frame.
     fn pump(&self) {
         if self.env.get::<KittyChannel>().is_none() {
             return;
         }
-        let mut slot = self.session.borrow_mut();
-        let Some(session) = slot.as_mut() else { return };
-        if session.needs_redraw() {
-            let now = Instant::now();
-            let delta = self
-                .last_frame
-                .replace(Some(now))
-                .map_or(FIRST_FRAME, |last| now - last);
-            session.render(delta);
-            match pollster::block_on(session.readback_rgba8()) {
-                Ok(output) => {
-                    if let Some(slot) = self.kitty.borrow().as_ref()
-                        && let Some(channel) = self.env.get::<KittyChannel>()
-                    {
-                        channel.send(if slot.placed.is_some() || self.is_underlay() {
-                            slot.image.store(&output.rgba8)
-                        } else {
-                            slot.image.frame(&output.rgba8, slot.cells.0, slot.cells.1)
-                        });
+        let mut session = self.session.borrow_mut();
+        let Some(session) = session.as_mut() else {
+            return;
+        };
+        let want_frame = self.requested.swap(false, Ordering::Acquire)
+            || matches!(*self.next.borrow(), Next::At { .. });
+        if want_frame {
+            match session {
+                Session::Gpu(session) => {
+                    session.view.frame();
+                    match session.renderer.present(
+                        &session.texture,
+                        Display {
+                            scale: 1.0,
+                            headroom: 1.0,
+                        },
+                        FrameTime::now(),
+                    ) {
+                        Ok(next) => {
+                            *self.next.borrow_mut() = next;
+                            if let Some(raster) = readback_frame(
+                                self.runtime.as_ref(),
+                                &session.texture,
+                                &session.buffer,
+                                session.stride,
+                            ) {
+                                self.publish(&raster);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("GPU content frame failed: {error}");
+                            self.failed.set(true);
+                        }
                     }
-                    *self.raster.borrow_mut() = Some(Raster {
-                        width: output.width,
-                        height: output.height,
-                        rgba8: output.rgba8,
-                    });
                 }
-                Err(error) => {
-                    tracing::warn!("offscreen GPU readback failed: {error}");
-                    self.failed.set(true);
-                }
+                Session::Scene {
+                    view,
+                    renderer,
+                    size,
+                } => match renderer.render(view.content_mut(), *size, 1.0) {
+                    Ok(image) => {
+                        let raster = Raster8 {
+                            width: image.width,
+                            height: image.height,
+                            rgba8: image.premultiplied_rgba8(),
+                        };
+                        self.publish(&raster);
+                    }
+                    Err(error) => {
+                        tracing::warn!("scene offscreen frame failed: {error}");
+                        self.failed.set(true);
+                    }
+                },
             }
         }
         // The session keeps the loop's frame timer alive while the view asks
         // for frames; once it settles, release this node's contribution so the
         // loop can sleep again.
-        let wants = session.needs_redraw();
+        let wants = matches!(*self.next.borrow(), Next::At { .. })
+            || self.requested.load(Ordering::Acquire);
         match (self.animating.get(), wants) {
             (false, true) => {
                 self.animating.set(true);
@@ -213,6 +345,24 @@ impl GpuState {
             }
             _ => {}
         }
+    }
+
+    /// Stores the raster and retransmits it onto the live kitty image.
+    fn publish(&self, raster: &Raster8) {
+        if let Some(slot) = self.kitty.borrow().as_ref()
+            && let Some(channel) = self.env.get::<KittyChannel>()
+        {
+            channel.send(if slot.placed.is_some() || self.is_underlay() {
+                slot.image.store(&raster.rgba8)
+            } else {
+                slot.image.frame(&raster.rgba8, slot.cells.0, slot.cells.1)
+            });
+        }
+        *self.raster.borrow_mut() = Some(Raster8 {
+            width: raster.width,
+            height: raster.height,
+            rgba8: raster.rgba8.clone(),
+        });
     }
 
     /// Whether this node was dispatched as a non-topmost `FixedContainer`
@@ -230,7 +380,7 @@ impl GpuState {
     /// area.
     fn draw_kitty(
         &self,
-        raster: &Raster,
+        raster: &Raster8,
         size: (u16, u16),
         area: CellRect,
         origin: (i32, i32),
@@ -285,7 +435,7 @@ impl GpuState {
     fn draw_underlay(
         &self,
         slot: &mut KittySlot,
-        raster: &Raster,
+        raster: &Raster8,
         size: (u16, u16),
         area: CellRect,
         origin: (i32, i32),
@@ -360,11 +510,11 @@ impl GpuState {
     /// Draws the rasterized pixels (or a placeholder) into the `clip` region
     /// of the frame at signed `origin` with cell `size`.
     ///
-    /// The surface is rasterized at a fixed pixel resolution (`MAX_TRANSMIT_PX`
-    /// cap); `clip` only bounds which cells are written. On kitty the
-    /// placeholders clip and scroll with the grid at any visibility; on
-    /// Sixel/iTerm2 a real image is used only when the whole frame is visible,
-    /// since those protocols cannot clip mid-image.
+    /// The content is rasterized at a fixed pixel resolution
+    /// (`MAX_TRANSMIT_PX` cap); `clip` only bounds which cells are written.
+    /// On kitty the placeholders clip and scroll with the grid at any
+    /// visibility; on Sixel/iTerm2 a real image is used only when the whole
+    /// frame is visible, since those protocols cannot clip mid-image.
     pub fn draw(
         &self,
         origin: (i32, i32),
@@ -435,6 +585,102 @@ impl GpuState {
             }
         }
     }
+}
+
+/// Creates the texture `GpuContentRenderer::present` draws into and the
+/// staging buffer its pixels are copied back through.
+fn readback_target(
+    runtime: &GpuRuntime,
+    size: OffscreenSize,
+) -> (wgpu::Texture, wgpu::Buffer, u32) {
+    let stride = (size.width() * 4).div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+    let texture = runtime.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("waterui-tui gpu readback"),
+        size: wgpu::Extent3d {
+            width: size.width(),
+            height: size.height(),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let buffer = runtime.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("waterui-tui gpu readback staging"),
+        size: u64::from(stride) * u64::from(size.height()),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    (texture, buffer, stride)
+}
+
+/// Copies the presented texture into the staging buffer and maps it back as
+/// tightly packed `RGBA8` rows.
+fn readback_frame(
+    runtime: Option<&GpuRuntime>,
+    texture: &wgpu::Texture,
+    buffer: &wgpu::Buffer,
+    stride: u32,
+) -> Option<Raster8> {
+    let runtime = runtime?;
+    let device = runtime.device();
+    let (width, height) = (texture.width(), texture.height());
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("waterui-tui gpu readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    runtime.queue().submit(Some(encoder.finish()));
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .expect("wgpu device poll for readback map succeeds");
+    rx.recv()
+        .expect("map_async always answers")
+        .expect("readback buffer maps");
+    let packed = {
+        let mapped = slice.get_mapped_range().expect("readback buffer maps");
+        mapped
+            .chunks(stride as usize)
+            .take(height as usize)
+            .flat_map(|row| row[..width as usize * 4].iter().copied())
+            .collect()
+    };
+    buffer.unmap();
+    Some(Raster8 {
+        width,
+        height,
+        rgba8: packed,
+    })
 }
 
 impl Drop for GpuState {

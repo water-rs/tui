@@ -8,18 +8,18 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-waterui-core = "0.3.2"
-waterui-backend-core = { version = "0.1.2", default-features = false }
-waterui-layout = "0.3.2"
-waterui-text = "0.4.1"
-waterui-controls = "0.3.2"
-waterui-graphics = { version = "0.4.1", default-features = false, features = ["gpu"] }
-waterui-icon = "0.3.2"
-waterui-internal = { version = "0.4.1", default-features = false }
-waterui-form = "0.3.2"
-waterui-navigation = "0.3.2"
-waterui-shape = "0.1.2"
-nami = "0.11.2"
+waterui-core = "0.5.1"
+waterui-backend-core = { version = "0.5.2", default-features = false }
+waterui-layout = "0.5.1"
+waterui-text = "0.5.1"
+waterui-controls = "0.5.1"
+waterui-graphics = { version = "0.5.1", default-features = false, features = ["cpu", "gpu"] }
+waterui-icon = "0.5.1"
+waterui-internal = { version = "0.5.1", default-features = false }
+waterui-form = "0.5.1"
+waterui-navigation = "0.5.1"
+waterui-shape = "0.5.1"
+nami = "0.12"
 executor-core = { version = "0.7.1", features = ["std"] }
 native-executor = "0.8.0"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "scrolling-regions"] }
@@ -34,8 +34,8 @@ flate2 = "1.1"
 rustix = { version = "1.1.4", features = ["process", "termios"] }
 
 [dev-dependencies]
-aither-acp = "0.4"
-aither-mcp = "0.4"
+aither-acp = "0.6"
+aither-mcp = "0.6"
 async-channel = "2"
 async-process = "2.5.0"
 event-listener = "5.4.2"
@@ -43,23 +43,23 @@ futures-lite = "2.6.1"
 shell-escape = "0.1"
 strip-ansi-escapes = "0.2.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-waterui-text = { version = "0.4.1", features = ["markdown"] }
+waterui-text = { version = "0.5.1", features = ["markdown"] }
 
 # This repository develops against the WaterUI checkout next door; the patch
 # table is what keeps the version requirements above resolving to it. A
 # consumer that pins `waterui-tui` by git supplies its own `[patch]` — the
 # `water` CLI writes one into the generated crate.
 [patch.crates-io]
-aither-acp = { path = "/Users/lexoliu/Coding/aither/acp" }
-aither-mcp = { path = "/Users/lexoliu/Coding/aither/mcp" }
-waterui-core = { path = "/Users/lexoliu/Coding/waterui/core" }
-waterui-backend-core = { path = "/Users/lexoliu/Coding/waterui/backends/core" }
-waterui-layout = { path = "/Users/lexoliu/Coding/waterui/components/foundation/layout" }
-waterui-text = { path = "/Users/lexoliu/Coding/waterui/components/foundation/text" }
-waterui-controls = { path = "/Users/lexoliu/Coding/waterui/components/foundation/controls" }
-waterui-graphics = { path = "/Users/lexoliu/Coding/waterui/components/visual/graphics" }
-waterui-icon = { path = "/Users/lexoliu/Coding/waterui/components/foundation/icon" }
-waterui-internal = { path = "/Users/lexoliu/Coding/waterui/src" }
-waterui-form = { path = "/Users/lexoliu/Coding/waterui/components/foundation/form" }
-waterui-navigation = { path = "/Users/lexoliu/Coding/waterui/components/foundation/navigation" }
-waterui-shape = { path = "/Users/lexoliu/Coding/waterui/components/foundation/shape" }
+aither-acp = { path = "../../aither/acp" }
+aither-mcp = { path = "../../aither/mcp" }
+waterui-core = { path = "../../waterui/core" }
+waterui-backend-core = { path = "../../waterui/backends/core" }
+waterui-layout = { path = "../../waterui/components/foundation/layout" }
+waterui-text = { path = "../../waterui/components/foundation/text" }
+waterui-controls = { path = "../../waterui/components/foundation/controls" }
+waterui-graphics = { path = "../../waterui/components/visual/graphics" }
+waterui-icon = { path = "../../waterui/components/foundation/icon" }
+waterui-internal = { path = "../../waterui/src" }
+waterui-form = { path = "../../waterui/components/foundation/form" }
+waterui-navigation = { path = "../../waterui/components/foundation/navigation" }
+waterui-shape = { path = "../../waterui/components/foundation/shape" }

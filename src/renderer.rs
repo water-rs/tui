@@ -24,13 +24,13 @@ use waterui_core::accessibility::{
 use waterui_core::event::{LifeCycle, LifeCycleHook, OnEvent};
 use waterui_core::gesture::GestureObserver;
 use waterui_core::layout::{HorizontalAlignment, LayoutPriority, StretchAxis};
-use waterui_core::views::{SharedAnyViews, Views};
+use waterui_core::views::{SharedAnyViews, ViewSnapshot, Views};
 use waterui_core::{AnyView, Dynamic, Environment, Metadata, Native, Retain, Str, View};
 use waterui_form::secure::SecureFieldConfig;
-use waterui_graphics::AppliedFilter;
-use waterui_graphics::color::{Color, ResolvedColor};
-use waterui_graphics::gradient_renderer::ResolvedGradient;
-use waterui_graphics::{GpuRuntime, GpuSurface};
+use waterui_graphics::FilteredView;
+use waterui_graphics::Gradient;
+use waterui_graphics::color::Color;
+use waterui_graphics::{GpuContentView, GpuRuntime, SceneView};
 use waterui_icon::SystemIcon;
 use waterui_internal::background::{Background, MaterialBackground};
 use waterui_internal::border::Border;
@@ -49,7 +49,7 @@ use waterui_layout::container::{FixedContainer, LazyContainer};
 use waterui_layout::divider::Divider;
 use waterui_layout::safe_area::IgnoreSafeArea;
 use waterui_layout::scroll::ScrollView;
-use waterui_layout::spacer::{Spacer, SpacerLayout};
+use waterui_layout::spacer::Spacer;
 use waterui_layout::stack::Axis;
 use waterui_navigation::{
     NavigationLinkHint, NavigationTransitionDestination, NavigationTransitionSource,
@@ -298,10 +298,13 @@ impl TuiRenderer {
         d.register::<Native<Spacer>>(|_state, _ctx, view, env| {
             let stretch = view.stretch_axis();
             let mut node = Node::new(
-                Kind::Container(Box::new(SpacerLayout::from(view.into_inner()))),
+                Kind::Spacer {
+                    min_length: view.into_inner().min_length(),
+                },
                 env,
             );
             node.stretch = stretch;
+            node.priority = Spacer::DEFAULT_LAYOUT_PRIORITY;
             node
         });
 
@@ -327,21 +330,39 @@ impl TuiRenderer {
             node
         });
 
-        d.register::<Native<ResolvedColor>>(|_state, _ctx, view, env| {
-            let stretch = view.stretch_axis();
-            let mut node = Node::new(Kind::Fill(Computed::constant(view.into_inner())), env);
-            node.stretch = stretch;
-            node
-        });
-
-        d.register::<Native<ResolvedGradient>>(|_state, _ctx, view, env| {
+        d.register::<Native<Gradient>>(|_state, _ctx, view, env| {
             let stretch = view.stretch_axis();
             let mut node = Node::new(Kind::Gradient(view.into_inner()), env);
             node.stretch = stretch;
             node
         });
 
-        d.register::<Native<GpuSurface>>(|state, _ctx, view, env| {
+        d.register::<Native<SceneView>>(|state, _ctx, view, env| {
+            let stretch = view.stretch_axis();
+            let mut node = Node::new(
+                Kind::Gpu(Box::new(GpuState::scene(
+                    view.into_inner(),
+                    env,
+                    state.waker.clone(),
+                    state.animated.clone(),
+                ))),
+                env,
+            );
+            node.stretch = stretch;
+            node
+        });
+
+        d.register::<Native<FilteredView>>(|_state, ctx, view, env| {
+            // A terminal has no filter engine; the effect drops while the
+            // content and its reactive subscriptions survive.
+            let filtered = view.into_inner();
+            let mut node = ctx.dispatch(filtered.content, env);
+            node.retained
+                .push(waterui_core::Retain::new(filtered.guards));
+            node
+        });
+
+        d.register::<Native<GpuContentView>>(|state, _ctx, view, env| {
             let stretch = view.stretch_axis();
             let mut node = Node::new(
                 Kind::Gpu(Box::new(GpuState::new(
@@ -413,7 +434,7 @@ impl TuiRenderer {
             let stretch = view.stretch_axis();
             let config = view.into_inner();
             let label = config.label.accessibility_label();
-            let cursor = config.value.get().to_plain().chars().count();
+            let cursor = config.value.snapshot().to_plain().chars().count();
             let mut node = Node::new(
                 Kind::Field(FieldState {
                     label: label.clone(),
@@ -435,7 +456,7 @@ impl TuiRenderer {
             let stretch = view.stretch_axis();
             let config = view.into_inner();
             let label = config.label.accessibility_label();
-            let cursor = config.value.get().expose().chars().count();
+            let cursor = config.value.snapshot().expose().chars().count();
             let mut node = Node::new(
                 Kind::Secure(SecureState {
                     label: label.clone(),
@@ -521,15 +542,24 @@ impl TuiRenderer {
 
         d.register::<Native<ScrollView>>(|state, ctx, view, env| {
             let stretch = view.stretch_axis();
-            let (axis, content, controller) = view.into_inner().into_inner();
+            let waterui_layout::scroll::ScrollViewParts {
+                axis,
+                content,
+                controller,
+                offset,
+                ..
+            } = view.into_inner().into_inner();
             let requested = Rc::new(Cell::new(None));
             if let Some(controller) = controller {
                 let generation = controller.generation();
-                let target = controller.target();
+                // `ScrollRequest::animation` is an engine hint a cell grid
+                // cannot honor; the target alone is applied as a jump, the
+                // same way user wheel scrolls land instantly.
+                let request = controller.request();
                 let slot = requested.clone();
                 let dirty = state.dirty.clone();
                 let guard = generation.watch(move |_| {
-                    let point = target.get();
+                    let point = request.snapshot().target;
                     slot.set(Some((
                         (point.x / PT_PER_COL).round() as i32,
                         (point.y / PT_PER_ROW).round() as i32,
@@ -543,6 +573,7 @@ impl TuiRenderer {
                         offset: Cell::new((0, 0)),
                         extent: Cell::new((0, 0)),
                         requested,
+                        binding: offset.clone(),
                         drawn: Cell::new(None),
                     }),
                     env,
@@ -559,6 +590,7 @@ impl TuiRenderer {
                     offset: Cell::new((0, 0)),
                     extent: Cell::new((0, 0)),
                     requested,
+                    binding: offset,
                     drawn: Cell::new(None),
                 }),
                 env,
@@ -655,7 +687,7 @@ impl TuiRenderer {
             let contents_slot = contents.clone();
             let env_slot = env.clone();
             let dirty = state.dirty.clone();
-            let guard = contents.watch(.., move |_| {
+            let guard = contents.watch(.., move |_ctx, _change| {
                 *children_slot.borrow_mut() = materialize(&contents_slot, ctx, &env_slot);
                 dirty.set(true);
             });
@@ -743,7 +775,7 @@ impl TuiRenderer {
         d.register::<Metadata<Offset>>(|_state, ctx, metadata, env| {
             let node = ctx.dispatch(metadata.content, env);
             node.offset
-                .set((metadata.value.x.get(), metadata.value.y.get()));
+                .set((metadata.value.x.snapshot(), metadata.value.y.snapshot()));
             node
         });
 
@@ -776,7 +808,6 @@ impl TuiRenderer {
             Rotation,
             Scale,
             Shadow,
-            AppliedFilter,
             ClipShape,
             Background,
             MaterialBackground,
@@ -804,9 +835,9 @@ impl TuiRenderer {
 }
 
 fn materialize(contents: &SharedAnyViews<AnyView>, ctx: TuiCtx, env: &Environment) -> Vec<Node> {
-    let len = contents.len().get();
-    (0..len)
-        .filter_map(|index| contents.get_view(index))
+    let snapshot = contents.snapshot();
+    (snapshot.range())
+        .filter_map(|index| snapshot.get_view(index))
         .map(|view| ctx.dispatch(view, env))
         .collect()
 }

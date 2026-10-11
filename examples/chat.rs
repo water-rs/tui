@@ -31,12 +31,12 @@ use aither_acp::{
 use aither_mcp::protocol::JsonRpcError;
 use event_listener::Event;
 use futures_lite::AsyncReadExt;
-use nami::{Binding, SignalExt, binding};
+use nami::{Binding, Signal, SignalExt, binding};
 use waterui_controls::{button, field};
 use waterui_core::env::with;
 use waterui_core::layout::Point;
 use waterui_core::{Str, View};
-use waterui_graphics::color::{Color, MutedForegroundColor, ResolvedColor, Srgb};
+use waterui_graphics::color::{Color, MutedForegroundColor, Srgb};
 use waterui_internal::view::ViewExt;
 use waterui_layout::divider::Divider;
 use waterui_layout::scroll::{ScrollController, scroll};
@@ -437,7 +437,7 @@ impl ClientHandler for Forwarder {
 
 /// Pushes a new transcript row.
 fn push_line(lines: &Binding<Vec<Line>>, prefix: &'static str, text: impl Into<String>) {
-    let mut all = lines.get();
+    let mut all = lines.snapshot();
     all.push(Line {
         prefix,
         text: text.into(),
@@ -452,7 +452,7 @@ fn append_chunk(lines: &Binding<Vec<Line>>, prefix: &'static str, markdown: bool
     if text.is_empty() {
         return;
     }
-    let mut all = lines.get();
+    let mut all = lines.snapshot();
     match all.last_mut() {
         Some(last) if last.prefix == prefix => last.text.push_str(text),
         _ => all.push(Line {
@@ -482,7 +482,7 @@ fn apply(lines: &Binding<Vec<Line>>, terms: &mut HashMap<String, usize>, event: 
         } => {
             // Reserve the output row next to its `$` title so a command that
             // starts slowly still lands there instead of at the bottom.
-            let mut all = lines.get();
+            let mut all = lines.snapshot();
             all.push(Line {
                 prefix: "tool",
                 text: command,
@@ -497,7 +497,7 @@ fn apply(lines: &Binding<Vec<Line>>, terms: &mut HashMap<String, usize>, event: 
             lines.set(all);
         }
         AgentEvent::Term { terminal_id, text } => {
-            let mut all = lines.get();
+            let mut all = lines.snapshot();
             let index = *terms.entry(terminal_id).or_insert_with(|| {
                 all.push(Line {
                     prefix: "term",
@@ -575,7 +575,7 @@ fn render_tool_content(lines: &Binding<Vec<Line>>, content: &[ToolCallContent]) 
 
 /// Role colors for transcript prefixes.
 fn prefix_style(prefix: &str) -> Style {
-    let color = |r, g, b| Color::from(ResolvedColor::from_srgb(Srgb::new(r, g, b)));
+    let color = |r, g, b| Color::from(Srgb::new(r, g, b));
     match prefix {
         "you" => Style::new().foreground(color(0.42, 0.68, 1.0)),
         "devin" => Style::new().foreground(color(0.55, 0.85, 0.55)),
@@ -719,11 +719,23 @@ fn app() -> impl View {
                         return;
                     }
                 }
-                match client.new_session(cwd, Vec::new()).await {
+                match client
+                    .new_session(aither_acp::SessionNewParams {
+                        cwd,
+                        mcp_servers: Vec::new(),
+                        additional_directories: Vec::new(),
+                        meta: None,
+                    })
+                    .await
+                {
                     Ok(result) => {
                         if let Ok(model) = env::var("ACP_MODEL") {
                             let _ = client
-                                .set_config_option(&result.session_id, "model", model)
+                                .set_config_option(aither_acp::SessionSetConfigOptionParams::new(
+                                    &result.session_id,
+                                    "model",
+                                    model,
+                                ))
                                 .await;
                         }
                         *session.borrow_mut() = Some(result.session_id);
@@ -762,10 +774,10 @@ fn app() -> impl View {
         let scroller = scroller.clone();
         let follow = follow.clone();
         move || {
-            if busy.get() {
+            if busy.snapshot() {
                 return;
             }
-            let text = input.get().to_string();
+            let text = input.snapshot().to_string();
             let text = text.trim();
             if text.is_empty() {
                 return;
@@ -790,13 +802,15 @@ fn app() -> impl View {
             let text = text.to_string();
             executor_core::spawn_local(async move {
                 let result = client
-                    .prompt(
-                        &session_id,
-                        vec![ContentBlock::Text(TextContent {
+                    .prompt(aither_acp::PromptParams {
+                        session_id,
+                        prompt: vec![ContentBlock::Text(TextContent {
                             text,
                             annotations: None,
+                            meta: None,
                         })],
-                    )
+                        meta: None,
+                    })
                     .await;
                 if let Err(error) = result {
                     push_line(&lines, "status", format!("prompt failed: {error}"));

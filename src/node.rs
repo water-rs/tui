@@ -28,10 +28,11 @@ use waterui_core::layout::{
 use waterui_core::views::SharedAnyViews;
 use waterui_core::{AnyView, Environment};
 use waterui_form::secure::Secure;
-use waterui_graphics::color::ResolvedColor;
-use waterui_graphics::gradient_renderer::ResolvedGradient;
+use waterui_graphics::Gradient;
+use waterui_graphics::WorkingColor;
 use waterui_internal::component::progress::ProgressStyle;
 use waterui_layout::scroll::Axis as ScrollAxis;
+use waterui_layout::stack::Axis;
 use waterui_text::styled::StyledStr;
 
 use crate::gpu::GpuState;
@@ -121,6 +122,9 @@ pub struct ScrollState {
     pub extent: Cell<(u16, u16)>,
     /// Programmatic scroll target in cells, set by a `ScrollController` watch.
     pub requested: Rc<Cell<Option<(i32, i32)>>>,
+    /// The binding the view reads the content offset from, if one is
+    /// connected; written in points whenever the offset changes.
+    pub binding: Option<Binding<Point>>,
     /// The offset and on-screen region as last presented. Rendering compares
     /// the new offset against it and reports the delta as a
     /// [`crate::scroll::ScrollOp`] so the terminal can hardware-scroll the
@@ -236,7 +240,7 @@ pub enum Kind {
         vertical: bool,
     },
     /// Fills its frame with a color.
-    Fill(Computed<ResolvedColor>),
+    Fill(Computed<WorkingColor>),
     /// A fixed container: `layout` places `children`.
     Container(Box<dyn Layout>),
     /// A lazy container: `state.children` holds materialized nodes.
@@ -244,12 +248,17 @@ pub enum Kind {
     /// A view slot that is re-dispatched when its signal updates.
     Dynamic(Rc<RefCell<Node>>),
     /// Paints `children[0]`'s frame with a background color underneath.
-    Background(Computed<ResolvedColor>),
+    Background(Computed<WorkingColor>),
     /// A linear/radial/angular gradient filling its frame.
-    Gradient(ResolvedGradient),
-    /// GPU-rendered content (images, mesh gradients, shader surfaces)
-    /// rasterized into the cell grid.
+    Gradient(Gradient),
+    /// GPU or engine-rendered content (images, gradients, shader surfaces,
+    /// canvases) rasterized into the cell grid.
     Gpu(Box<GpuState>),
+    /// A flexible gap with a minimum main-axis length.
+    Spacer {
+        /// The shortest extent the enclosing stack keeps on its main axis.
+        min_length: f32,
+    },
 }
 
 /// A dispatched view: layout leaf, drawable region, and event target.
@@ -267,6 +276,9 @@ pub struct Node {
     pub priority: i32,
     /// The quantized cell frame assigned by [`Node::set_frame`].
     pub frame: Cell<CellRect>,
+    /// The proposal the node's last `measure` ran against; `Layout::place`
+    /// wants the same proposal the layout was measured with.
+    measured: Cell<Option<ProposalSize>>,
     /// Focus id for interactive kinds.
     pub focus: Option<u32>,
     /// Two-way `.focused()` binding; written when the subtree gains or loses
@@ -292,6 +304,7 @@ impl Node {
             stretch: StretchAxis::None,
             priority: 0,
             frame: Cell::new(CellRect::ZERO),
+            measured: Cell::new(None),
             focus: None,
             focus_signal: None,
             offset: Cell::new((0.0, 0.0)),
@@ -328,20 +341,30 @@ impl Node {
         match &mut self.kind {
             Kind::Container(layout) => {
                 let refs = Self::child_refs(&self.children);
-                let frames = layout.place(frame, &refs);
-                for (child, child_frame) in self.children.iter_mut().zip(frames) {
-                    child.set_frame(child_frame);
+                let proposal = self
+                    .measured
+                    .get()
+                    .unwrap_or_else(|| ProposalSize::new(frame.width(), frame.height()));
+                let frames = layout.place(frame, proposal, &refs);
+                for (child, placement) in self.children.iter_mut().zip(frames) {
+                    child.set_frame(placement.frame);
                 }
             }
             Kind::Lazy(state) => {
                 let frames = {
                     let children = state.children.borrow();
                     let refs = Self::child_refs(&children);
-                    state.layout.place(frame, &refs)
+                    state.layout.place(
+                        frame,
+                        self.measured
+                            .get()
+                            .unwrap_or_else(|| ProposalSize::new(frame.width(), frame.height())),
+                        &refs,
+                    )
                 };
                 let mut children = state.children.borrow_mut();
-                for (child, child_frame) in children.iter_mut().zip(frames) {
-                    child.set_frame(child_frame);
+                for (child, placement) in children.iter_mut().zip(frames) {
+                    child.set_frame(placement.frame);
                 }
             }
             Kind::Dynamic(slot) => slot.borrow_mut().set_frame(frame),
@@ -516,7 +539,7 @@ impl Node {
                 }
                 let selected = tabs
                     .iter()
-                    .position(|tab| tab.id == selection.get())
+                    .position(|tab| tab.id == selection.snapshot())
                     .unwrap_or(0);
                 let content = PtRect::new(
                     Point::new(frame.x(), frame.y() + LINE_HEIGHT),
@@ -534,7 +557,11 @@ impl Node {
                 }
             }
             Kind::NavBar { hidden } => {
-                let bar = if hidden.get() { 0.0 } else { 2.0 * LINE_HEIGHT };
+                let bar = if hidden.snapshot() {
+                    0.0
+                } else {
+                    2.0 * LINE_HEIGHT
+                };
                 if let Some(title) = self.children.first_mut() {
                     title.set_frame(PtRect::new(
                         Point::new(frame.x(), frame.y()),
@@ -580,8 +607,8 @@ impl Node {
                 line_limit,
             } => {
                 draw_text(
-                    &content.get(),
-                    alignment.get(),
+                    &content.snapshot(),
+                    alignment.snapshot(),
                     *line_limit,
                     &TextGeometry {
                         origin: (fx, fy),
@@ -594,7 +621,7 @@ impl Node {
                 );
             }
             Kind::Fill(color) => {
-                buf.set_style(area, Style::default().bg(tui_color(color.get())));
+                buf.set_style(area, Style::default().bg(tui_color(color.snapshot())));
             }
             Kind::Divider { vertical } => {
                 let style = Style::default().fg(ctx.theme.border);
@@ -621,11 +648,11 @@ impl Node {
                 {
                     ctx.links
                         .borrow_mut()
-                        .push((area, target.0.get().into_string()));
+                        .push((area, target.0.snapshot().into_string()));
                 }
             }
             Kind::Toggle { value, style } => {
-                let on = value.get();
+                let on = value.snapshot();
                 let glyph = match style {
                     ToggleStyle::Switch => {
                         if on {
@@ -662,7 +689,7 @@ impl Node {
                 let (x0, x1) = track.get();
                 let span = *range.end() - *range.start();
                 let frac = if span.abs() > f64::EPSILON {
-                    (value.get() - range.start()) / span
+                    (value.snapshot() - range.start()) / span
                 } else {
                     0.0
                 }
@@ -692,8 +719,8 @@ impl Node {
             } => {
                 let shown = formatter
                     .as_ref()
-                    .map(|f| f.get().to_plain().into_string())
-                    .unwrap_or_else(|| format!("{}", value.get()));
+                    .map(|f| f.snapshot().to_plain().into_string())
+                    .unwrap_or_else(|| format!("{}", value.snapshot()));
                 let digits = (shown.width() as u16).max(stepper_digits(range));
                 let cluster = 3 + 1 + digits + 1 + 3;
                 let cx = (area.x + area.width).saturating_sub(cluster);
@@ -710,11 +737,15 @@ impl Node {
                 style: progress_style,
                 bar,
             } => {
-                draw_progress(*progress_style, value.get(), bar.get(), area, ctx, buf);
+                draw_progress(*progress_style, value.snapshot(), bar.get(), area, ctx, buf);
             }
-            Kind::Empty | Kind::Container(_) | Kind::Lazy(_) | Kind::Dynamic(_) => {}
+            Kind::Empty
+            | Kind::Container(_)
+            | Kind::Lazy(_)
+            | Kind::Dynamic(_)
+            | Kind::Spacer { .. } => {}
             Kind::Background(color) => {
-                buf.set_style(area, Style::default().bg(tui_color(color.get())));
+                buf.set_style(area, Style::default().bg(tui_color(color.snapshot())));
             }
             Kind::Gradient(gradient) => {
                 draw_gradient(
@@ -742,7 +773,7 @@ impl Node {
             Kind::Tabs { selection, tabs } => {
                 let selected = tabs
                     .iter()
-                    .position(|tab| tab.id == selection.get())
+                    .position(|tab| tab.id == selection.snapshot())
                     .unwrap_or(0);
                 for (index, entry) in tabs.iter().enumerate() {
                     let label = self.children[index].frame.get();
@@ -753,11 +784,11 @@ impl Node {
                                 .fg(ctx.theme.accent)
                                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                         );
-                    } else if !entry.enabled.get() {
+                    } else if !entry.enabled.snapshot() {
                         buf.set_style(label, Style::default().fg(ctx.theme.muted));
                     }
                     if let Some(badge) = &entry.badge {
-                        let text = format!(" {}", badge.get());
+                        let text = format!(" {}", badge.snapshot());
                         buf.set_stringn(
                             label.x + label.width,
                             label.y,
@@ -769,7 +800,7 @@ impl Node {
                 }
             }
             Kind::NavBar { hidden } => {
-                if !hidden.get() && area.height > 1 {
+                if !hidden.snapshot() && area.height > 1 {
                     // Title row is children[0]; the second bar row is a rule.
                     buf.set_stringn(
                         area.x,
@@ -820,7 +851,7 @@ impl Node {
                 let n = tabs.len();
                 let selected = tabs
                     .iter()
-                    .position(|tab| tab.id == selection.get())
+                    .position(|tab| tab.id == selection.snapshot())
                     .unwrap_or(0);
                 for (index, child) in self.children.iter().enumerate() {
                     if index < n || index - n == selected {
@@ -920,7 +951,7 @@ impl Node {
                 Kind::Toggle { value, .. }
                     if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) =>
                 {
-                    value.set(!value.get());
+                    value.set(!value.snapshot());
                     true
                 }
                 Kind::Field(field) => {
@@ -945,11 +976,11 @@ impl Node {
                     let step = (*range.end() - *range.start()) / 20.0;
                     match key.code {
                         KeyCode::Left | KeyCode::Down | KeyCode::Char('-') => {
-                            value.set((value.get() - step).max(*range.start()));
+                            value.set((value.snapshot() - step).max(*range.start()));
                             true
                         }
                         KeyCode::Right | KeyCode::Up | KeyCode::Char('+') => {
-                            value.set((value.get() + step).min(*range.end()));
+                            value.set((value.snapshot() + step).min(*range.end()));
                             true
                         }
                         KeyCode::Home => {
@@ -967,11 +998,11 @@ impl Node {
                     value, step, range, ..
                 } => match key.code {
                     KeyCode::Left | KeyCode::Char('-') => {
-                        value.set((value.get() - step.get()).max(*range.start()));
+                        value.set((value.snapshot() - step.snapshot()).max(*range.start()));
                         true
                     }
                     KeyCode::Right | KeyCode::Char('+') => {
-                        value.set((value.get() + step.get()).min(*range.end()));
+                        value.set((value.snapshot() + step.snapshot()).min(*range.end()));
                         true
                     }
                     _ => false,
@@ -996,14 +1027,14 @@ impl Node {
                     KeyCode::Left | KeyCode::Right => {
                         let current = tabs
                             .iter()
-                            .position(|tab| tab.id == selection.get())
+                            .position(|tab| tab.id == selection.snapshot())
                             .unwrap_or(0) as i32;
                         let dir = if key.code == KeyCode::Left { -1 } else { 1 };
                         let n = tabs.len() as i32;
                         for step in 1..=n {
                             let index = (current + dir * step).rem_euclid(n);
                             let tab = &tabs[index as usize];
-                            if tab.enabled.get() {
+                            if tab.enabled.snapshot() {
                                 selection.set(tab.id);
                                 return true;
                             }
@@ -1082,11 +1113,15 @@ impl Node {
         let Kind::Scroll(scroll) = &self.kind else {
             return;
         };
+        let viewport = self.frame.get();
+        let (cw, ch) = scroll.extent.get();
+        if let Some(binding) = &scroll.binding {
+            let (ox, oy) = scroll.offset.get();
+            binding.set(Point::new(ox as f32 * PT_PER_COL, oy as f32 * PT_PER_ROW));
+        }
         let Some(callback) = self.env.get::<crate::OnScroll>() else {
             return;
         };
-        let viewport = self.frame.get();
-        let (cw, ch) = scroll.extent.get();
         (callback.0.borrow_mut())(crate::ScrollMetrics {
             offset: scroll.offset.get(),
             max: (
@@ -1236,7 +1271,7 @@ impl Node {
             Kind::Button { action, .. } if !drag => {
                 (action.borrow_mut())(&self.env);
             }
-            Kind::Toggle { value, .. } if !drag => value.set(!value.get()),
+            Kind::Toggle { value, .. } if !drag => value.set(!value.snapshot()),
             Kind::Slider {
                 value,
                 range,
@@ -1258,7 +1293,7 @@ impl Node {
             } if !drag => {
                 let shown = formatter
                     .as_ref()
-                    .map(|f| f.get().to_plain().width() as u16)
+                    .map(|f| f.snapshot().to_plain().width() as u16)
                     .unwrap_or(0);
                 let digits = shown.max(stepper_digits(range));
                 let cluster = 3 + 1 + digits + 1 + 3;
@@ -1266,16 +1301,16 @@ impl Node {
                 let minus = (cx..cx + 3).contains(&col);
                 let plus = (cx + i32::from(cluster) - 3..cx + i32::from(cluster)).contains(&col);
                 if minus {
-                    value.set((value.get() - step.get()).max(*range.start()));
+                    value.set((value.snapshot() - step.snapshot()).max(*range.start()));
                 } else if plus {
-                    value.set((value.get() + step.get()).min(*range.end()));
+                    value.set((value.snapshot() + step.snapshot()).min(*range.end()));
                 }
             }
             Kind::Tabs { selection, tabs } if !drag && row == i32::from(area.y) => {
                 for (index, entry) in tabs.iter().enumerate() {
                     let label = self.children[index].frame.get();
                     if i32::from(label.x) <= col && col < i32::from(label.x + label.width) + 2 {
-                        if entry.enabled.get() {
+                        if entry.enabled.snapshot() {
                             selection.set(entry.id);
                         }
                         break;
@@ -1314,13 +1349,14 @@ impl Node {
 
 impl SubView for Node {
     fn measure(&self, proposal: ProposalSize) -> ViewDimensions {
+        self.measured.set(Some(proposal));
         let size = match &self.kind {
             Kind::Empty => Size::zero(),
             Kind::Text {
                 content,
                 line_limit,
                 ..
-            } => measure_text(&content.get(), *line_limit, proposal.width),
+            } => measure_text(&content.snapshot(), *line_limit, proposal.width),
             Kind::Button { style, .. } => {
                 let label = self
                     .children
@@ -1342,20 +1378,21 @@ impl SubView for Node {
                 Size::new(label.width + 4.0, label.height.max(LINE_HEIGHT))
             }
             Kind::Field(field) => {
-                let label_width = field.label.get().to_plain().width() as f32;
+                let label_width = field.label.snapshot().to_plain().width() as f32;
                 let content_width = (field
                     .value
-                    .get()
+                    .snapshot()
                     .to_plain()
                     .width()
-                    .max(field.prompt.get().to_plain().width())
+                    .max(field.prompt.snapshot().to_plain().width())
                     as f32)
                     .max(8.0);
                 Size::new(label_width + 2.0 + content_width, LINE_HEIGHT)
             }
             Kind::Secure(state) => {
-                let label_width = state.label.get().to_plain().width() as f32;
-                let content_width = (state.value.get().expose().chars().count() as f32).max(8.0);
+                let label_width = state.label.snapshot().to_plain().width() as f32;
+                let content_width =
+                    (state.value.snapshot().expose().chars().count() as f32).max(8.0);
                 Size::new(label_width + 2.0 + content_width, LINE_HEIGHT)
             }
             Kind::Slider { .. } => {
@@ -1435,7 +1472,11 @@ impl SubView for Node {
                     .get(1)
                     .map(|child| child.measure(proposal).size)
                     .unwrap_or_default();
-                let bar = if hidden.get() { 0.0 } else { 2.0 * LINE_HEIGHT };
+                let bar = if hidden.snapshot() {
+                    0.0
+                } else {
+                    2.0 * LINE_HEIGHT
+                };
                 Size::new(
                     proposal.width_or(content.width),
                     proposal.height_or(content.height + bar),
@@ -1450,6 +1491,13 @@ impl SubView for Node {
             }
             Kind::Fill(_) | Kind::Gradient(_) | Kind::Gpu(_) => {
                 Size::new(proposal.width_or(0.0), proposal.height_or(0.0))
+            }
+            Kind::Spacer { min_length } => {
+                let horizontal = matches!(self.env.get::<Axis>(), Some(Axis::Horizontal));
+                Size::new(
+                    if horizontal { *min_length } else { 0.0 },
+                    if horizontal { 0.0 } else { *min_length },
+                )
             }
             Kind::Container(layout) => {
                 return measure_layout(
@@ -1789,7 +1837,7 @@ fn stepper_digits(range: &RangeInclusive<i32>) -> u16 {
 }
 
 fn draw_field(field: &FieldState, focused: bool, area: CellRect, buf: &mut Buffer, ctx: &DrawCtx) {
-    let label = field.label.get();
+    let label = field.label.snapshot();
     let label_text = label.to_plain();
     let label_width = label_text.width();
     let muted = Style::default().fg(ctx.theme.muted);
@@ -1801,12 +1849,12 @@ fn draw_field(field: &FieldState, focused: bool, area: CellRect, buf: &mut Buffe
         x = buf.set_stringn(x, area.y, ": ", 2, muted).0;
     }
 
-    let value = field.value.get();
+    let value = field.value.snapshot();
     let plain = value.to_plain();
     let text: &str = &plain;
     let empty = text.is_empty();
     let shown: String = if empty {
-        field.prompt.get().to_plain().into_string()
+        field.prompt.snapshot().to_plain().into_string()
     } else {
         text.to_owned()
     };
@@ -1834,7 +1882,7 @@ fn draw_secure(
     buf: &mut Buffer,
     ctx: &DrawCtx,
 ) {
-    let label = state.label.get();
+    let label = state.label.snapshot();
     let label_text = label.to_plain();
     let label_width = label_text.width();
     let muted = Style::default().fg(ctx.theme.muted);
@@ -1846,7 +1894,7 @@ fn draw_secure(
         x = buf.set_stringn(x, area.y, ": ", 2, muted).0;
     }
 
-    let chars = state.value.get().expose().chars().count();
+    let chars = state.value.snapshot().expose().chars().count();
     let shown = "•".repeat(chars);
     let style = if focused {
         ctx.theme.text().add_modifier(Modifier::UNDERLINED)
@@ -1891,7 +1939,7 @@ fn edit_chars(chars: &mut Vec<char>, cursor: &mut usize, key: &KeyEvent) -> bool
 }
 
 fn field_key(field: &FieldState, key: &KeyEvent) -> bool {
-    let mut chars: Vec<char> = field.value.get().to_plain().chars().collect();
+    let mut chars: Vec<char> = field.value.snapshot().to_plain().chars().collect();
     let mut cursor = field.cursor.get();
     if edit_chars(&mut chars, &mut cursor, key) {
         field
@@ -1905,7 +1953,7 @@ fn field_key(field: &FieldState, key: &KeyEvent) -> bool {
 }
 
 fn secure_key(state: &SecureState, key: &KeyEvent) -> bool {
-    let mut chars: Vec<char> = state.value.get().expose().chars().collect();
+    let mut chars: Vec<char> = state.value.snapshot().expose().chars().collect();
     let mut cursor = state.cursor.get();
     if edit_chars(&mut chars, &mut cursor, key) {
         state

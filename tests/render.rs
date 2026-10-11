@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use nami::{Binding, SignalExt, binding};
+use nami::{Binding, Signal, SignalExt, binding};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use waterui_controls::{button, toggle};
@@ -132,7 +132,7 @@ fn button_renders_chrome_and_activates() {
     let counter2 = counter.clone();
     let view = vstack((
         text(counter.clone().map(|v| format!("count={v}")).computed()),
-        button("Bump").action(move || counter2.set(counter2.get() + 1)),
+        button("Bump").action(move || counter2.set(counter2.snapshot() + 1)),
     ))
     .spacing(0.0);
     let mut fixture = Fixture::new(view, 40, 5);
@@ -144,7 +144,7 @@ fn button_renders_chrome_and_activates() {
     let chain = fixture.focus_chain();
     assert_eq!(chain.len(), 1);
     assert!(fixture.press(chain[0], KeyCode::Enter));
-    assert_eq!(counter.get(), 1);
+    assert_eq!(counter.snapshot(), 1);
     assert!(fixture.take_dirty(), "action should mark the tree dirty");
 
     let out = fixture.draw(40, 5);
@@ -197,7 +197,7 @@ fn toggle_flips_on_space() {
     let chain = fixture.focus_chain();
     assert_eq!(chain.len(), 1);
     assert!(fixture.press(chain[0], KeyCode::Char(' ')));
-    assert!(value.get());
+    assert!(value.snapshot());
 
     let out = fixture.draw(40, 5);
     assert!(out.contains("[x] Enable"), "got:\n{out}");
@@ -320,13 +320,13 @@ fn text_field_edits_binding() {
     for c in ['h', 'i'] {
         assert!(fixture.press(chain[0], KeyCode::Char(c)));
     }
-    assert_eq!(&*value.get(), "hi");
+    assert_eq!(&*value.snapshot(), "hi");
 
     let out = fixture.draw(40, 5);
     assert!(out.contains("Name: hi"), "got:\n{out}");
 
     assert!(fixture.press(chain[0], KeyCode::Backspace));
-    assert_eq!(&*value.get(), "h");
+    assert_eq!(&*value.snapshot(), "h");
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn hit_testing_finds_focusable() {
     let counter2 = counter.clone();
     let view = vstack((
         text("count"),
-        button("Bump").action(move || counter2.set(counter2.get() + 1)),
+        button("Bump").action(move || counter2.set(counter2.snapshot() + 1)),
     ))
     .spacing(0.0);
     let mut fixture = Fixture::new(view, 40, 5);
@@ -359,7 +359,7 @@ fn hit_testing_finds_focusable() {
             .mouse(button_frame.x + 1, button_frame.y, false),
         Some(chain[0])
     );
-    assert_eq!(counter.get(), 1);
+    assert_eq!(counter.snapshot(), 1);
 }
 
 #[test]
@@ -374,18 +374,22 @@ fn slider_arrows_and_track_click() {
 
     let chain = fixture.focus_chain();
     assert!(fixture.press(chain[0], KeyCode::Right));
-    assert!((value.get() - 0.55).abs() < 1e-9, "got {}", value.get());
+    assert!(
+        (value.snapshot() - 0.55).abs() < 1e-9,
+        "got {}",
+        value.snapshot()
+    );
     assert!(fixture.press(chain[0], KeyCode::Home));
-    assert_eq!(value.get(), 0.0);
+    assert_eq!(value.snapshot(), 0.0);
     assert!(fixture.press(chain[0], KeyCode::End));
-    assert_eq!(value.get(), 1.0);
+    assert_eq!(value.snapshot(), 1.0);
 
     // Click at the far right of the track sets ~1.0.
     let frame = fixture.root.frame.get();
     fixture
         .root
         .mouse(frame.x + frame.width - 1, frame.y, false);
-    assert!(value.get() > 0.9, "got {}", value.get());
+    assert!(value.snapshot() > 0.9, "got {}", value.snapshot());
 }
 
 #[test]
@@ -400,17 +404,17 @@ fn stepper_increments_with_keys_and_clicks() {
 
     let chain = fixture.focus_chain();
     assert!(fixture.press(chain[0], KeyCode::Right));
-    assert_eq!(value.get(), 1);
+    assert_eq!(value.snapshot(), 1);
     // Click on the `[+]` region (rightmost 3 cells of the row).
     let frame = fixture.root.frame.get();
     fixture
         .root
         .mouse(frame.x + frame.width - 1, frame.y, false);
-    assert_eq!(value.get(), 2);
+    assert_eq!(value.snapshot(), 2);
     fixture
         .root
         .mouse(frame.x + frame.width - 9, frame.y, false);
-    assert_eq!(value.get(), 1, "click on [-] should decrement");
+    assert_eq!(value.snapshot(), 1, "click on [-] should decrement");
 }
 
 #[test]
@@ -446,7 +450,7 @@ fn secure_field_masks_and_edits() {
     for c in ['h', 'i'] {
         assert!(fixture.press(chain[0], KeyCode::Char(c)));
     }
-    assert_eq!(value.get().expose(), "hi");
+    assert_eq!(value.snapshot().expose(), "hi");
 
     let out = fixture.draw(40, 3);
     assert!(out.contains("Pass: ••"), "got:\n{out}");
@@ -515,7 +519,7 @@ fn tabs_render_labels_and_switch() {
 
     let chain = fixture.focus_chain();
     assert!(fixture.press(chain[0], KeyCode::Right));
-    assert_eq!(selection.get(), 1);
+    assert_eq!(selection.snapshot(), 1);
     let out = fixture.draw(40, 6);
     assert!(out.contains("second-page"), "got:\n{out}");
     assert!(!out.contains("first-page"), "got:\n{out}");
@@ -548,17 +552,18 @@ fn focused_binding_requests_focus() {
     assert_eq!(requests, vec![chain[0]], "should request the field's id");
 }
 
-fn srgb(r: u8, g: u8, b: u8) -> waterui_graphics::color::ResolvedColor {
-    waterui_graphics::color::ResolvedColor::from_srgb(waterui_graphics::color::Srgb::new(
+fn srgb(r: u8, g: u8, b: u8) -> waterui_graphics::WorkingColor {
+    waterui_graphics::color::Srgb::new(
         f32::from(r) / 255.0,
         f32::from(g) / 255.0,
         f32::from(b) / 255.0,
-    ))
+    )
+    .resolve()
 }
 
 #[test]
 fn linear_gradient_interpolates_per_cell() {
-    use waterui_graphics::gradient_renderer::Gradient;
+    use waterui_graphics::Gradient;
     let view = Gradient::linear(
         vec![(0.0, srgb(255, 0, 0)), (1.0, srgb(0, 0, 255))],
         [0.0, 0.5],
@@ -587,46 +592,46 @@ fn linear_gradient_interpolates_per_cell() {
 
 #[test]
 fn gradient_sample_respects_geometry() {
-    use waterui_graphics::gradient_renderer::{Gradient, ResolvedGradient};
+    use waterui_graphics::Gradient;
     use waterui_tui::gradient::sample;
 
     // Vertical linear: top is red, bottom is blue.
-    let linear = ResolvedGradient::linear(
-        vec![
-            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(0.0, srgb(255, 0, 0)),
-            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(1.0, srgb(0, 0, 255)),
-        ],
+    let linear = Gradient::linear(
+        vec![(0.0, srgb(255, 0, 0)), (1.0, srgb(0, 0, 255))],
         [0.5, 0.0],
         [0.5, 1.0],
     );
     let top = sample(&linear, 0.5, 0.01);
     let bottom = sample(&linear, 0.5, 0.99);
-    assert!(top.red > top.blue, "top should be red: {top:?}");
     assert!(
-        bottom.blue > bottom.red,
+        top.components[0] > top.components[2],
+        "top should be red: {top:?}"
+    );
+    assert!(
+        bottom.components[2] > bottom.components[0],
         "bottom should be blue: {bottom:?}"
     );
 
     // Radial: center is red, outside is blue.
-    let radial = ResolvedGradient::radial(
-        vec![
-            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(0.0, srgb(255, 0, 0)),
-            waterui_graphics::gradient_renderer::ResolvedGradientStop::new(1.0, srgb(0, 0, 255)),
-        ],
+    let radial = Gradient::radial(
+        vec![(0.0, srgb(255, 0, 0)), (1.0, srgb(0, 0, 255))],
         [0.5, 0.5],
         0.0,
         0.5,
     );
     let center = sample(&radial, 0.5, 0.5);
     let corner = sample(&radial, 0.0, 0.0);
-    assert!(center.red > center.blue, "center should be red: {center:?}");
     assert!(
-        corner.blue > corner.red,
+        center.components[0] > center.components[2],
+        "center should be red: {center:?}"
+    );
+    assert!(
+        corner.components[2] > corner.components[0],
         "corner should be blue: {corner:?}"
     );
 
-    // A mesh gradient never reaches `ResolvedGradient`; constructing one is
-    // fine but it dispatches through the GPU path instead.
+    // A mesh gradient never reaches `sample`; constructing one is fine but
+    // it dispatches through the scene/engine path instead.
     let _mesh = Gradient::mesh(
         2,
         2,
@@ -640,14 +645,14 @@ fn gradient_sample_respects_geometry() {
     );
 }
 
-/// A `GpuView` that clears the surface to solid red — exercises the same
-/// `Native<GpuSurface>` path `waterui_image::Image` and mesh gradients take.
-struct ClearView;
+/// A `GpuContent` that clears the frame to solid red — exercises the same
+/// `Native<GpuContentView>` path `waterui_image` content takes.
+struct ClearContent;
 
-impl waterui_graphics::GpuView for ClearView {
-    async fn setup(&mut self, _ctx: &waterui_graphics::GpuContext<'_>, _env: &mut Environment) {}
+impl waterui_graphics::GpuContent for ClearContent {
+    fn setup(&mut self, _gpu: &waterui_graphics::gpu::Context<'_>) {}
 
-    fn render(&mut self, frame: &mut waterui_graphics::GpuFrame) {
+    fn render(&mut self, frame: &mut waterui_graphics::gpu::Frame<'_>) {
         use waterui_graphics::wgpu;
         let mut encoder = frame
             .device
@@ -656,7 +661,7 @@ impl waterui_graphics::GpuView for ClearView {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
+                    view: frame.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::RED),
@@ -673,7 +678,7 @@ impl waterui_graphics::GpuView for ClearView {
 
 #[test]
 fn gpu_surface_rasterizes_into_half_blocks() {
-    let view = waterui_graphics::GpuSurface::new(ClearView);
+    let view = waterui_graphics::GpuContentView::new(ClearContent);
     let mut fixture = Fixture::new(view, 4, 2);
     let buf = fixture.render_buf(4, 2);
 
