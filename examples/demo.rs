@@ -5,12 +5,12 @@
 
 use std::io;
 
-use nami::{Binding, SignalExt, binding};
+use nami::{Binding, Signal, SignalExt, binding};
 use waterui_controls::{button, field, slider, stepper, toggle};
 use waterui_core::Str;
 use waterui_form::secure::{Secure, secure};
-use waterui_graphics::color::{Color, MutedForegroundColor, ResolvedColor, Srgb};
-use waterui_graphics::gradient_renderer::Gradient;
+use waterui_graphics::Gradient;
+use waterui_graphics::color::{Color, MutedForegroundColor, Srgb, WorkingColor};
 use waterui_internal::component::progress::progress;
 use waterui_layout::divider::Divider;
 use waterui_layout::frame::Frame;
@@ -22,12 +22,13 @@ use waterui_navigation::{NavigationView, Tab, Tabs};
 use waterui_text::styled::StyledStr;
 use waterui_text::text::text;
 
-fn rgb(r: u8, g: u8, b: u8) -> ResolvedColor {
-    ResolvedColor::from_srgb(Srgb::new(
+fn rgb(r: u8, g: u8, b: u8) -> WorkingColor {
+    Srgb::new(
         f32::from(r) / 255.0,
         f32::from(g) / 255.0,
         f32::from(b) / 255.0,
-    ))
+    )
+    .resolve()
 }
 
 fn main() -> io::Result<()> {
@@ -56,11 +57,11 @@ fn main() -> io::Result<()> {
         move || {
             let decrement = {
                 let counter = counter.clone();
-                button("Decrement").action(move || counter.set(counter.get() - 1))
+                button("Decrement").action(move || counter.set(counter.snapshot() - 1))
             };
             let increment = {
                 let counter = counter.clone();
-                button("Increment").action(move || counter.set(counter.get() + 1))
+                button("Increment").action(move || counter.set(counter.snapshot() + 1))
             };
             let counter_text = counter
                 .clone()

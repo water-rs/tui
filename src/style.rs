@@ -5,15 +5,15 @@ use ratatui::style::{Color, Modifier, Style};
 use waterui_core::Environment;
 use waterui_graphics::color::{
     AccentColor, AccentForegroundColor, BackgroundColor, BorderColor, ForegroundColor,
-    MutedForegroundColor, ResolvedColor, SelectionContainerColor, SelectionForegroundColor,
-    SurfaceColor,
+    MutedForegroundColor, SelectionContainerColor, SelectionForegroundColor, SurfaceColor,
+    WorkingColor, working::to_srgb,
 };
 use waterui_text::font::FontWeight;
 
 /// Converts a resolved WaterUI color to a 24-bit terminal color.
 #[must_use]
-pub fn tui_color(color: ResolvedColor) -> Color {
-    let srgb = color.to_srgb_with_headroom();
+pub fn tui_color(color: WorkingColor) -> Color {
+    let srgb = to_srgb(color);
     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color::Rgb(channel(srgb.red), channel(srgb.green), channel(srgb.blue))
 }
@@ -24,14 +24,14 @@ pub fn tui_color(color: ResolvedColor) -> Color {
 /// pixels are approximated by mixing in sRGB space over the color already
 /// underneath the cell.
 #[must_use]
-pub fn composite_over(src: ResolvedColor, under: Color) -> Color {
-    let srgb = src.to_srgb_with_headroom();
+pub fn composite_over(src: WorkingColor, under: Color) -> Color {
+    let srgb = to_srgb(src);
     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     composite_rgb8(
         channel(srgb.red),
         channel(srgb.green),
         channel(srgb.blue),
-        (src.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (src.components[3].clamp(0.0, 1.0) * 255.0).round() as u8,
         under,
     )
 }
@@ -92,8 +92,8 @@ impl Theme {
     #[must_use]
     pub fn resolve(env: &Environment) -> Self {
         fn slot<K: 'static>(env: &Environment) -> Option<Color> {
-            env.query::<K, Computed<ResolvedColor>>()
-                .map(|signal| tui_color(signal.get()))
+            env.query::<K, Computed<WorkingColor>>()
+                .map(|signal| tui_color(signal.snapshot()))
         }
         Self {
             foreground: slot::<ForegroundColor>(env).unwrap_or(Color::White),
@@ -123,7 +123,7 @@ pub fn chunk_style(
     base: Style,
 ) -> Style {
     let mut style = base;
-    let font = text_style.font.resolve(env).get();
+    let font = text_style.font.resolve(env).snapshot();
     if matches!(
         font.weight,
         FontWeight::SemiBold | FontWeight::Bold | FontWeight::UltraBold | FontWeight::Black
@@ -140,10 +140,10 @@ pub fn chunk_style(
         style = style.add_modifier(Modifier::CROSSED_OUT);
     }
     if let Some(foreground) = &text_style.foreground {
-        style = style.fg(tui_color(foreground.resolve(env).get()));
+        style = style.fg(tui_color(foreground.resolve(env).snapshot()));
     }
     if let Some(background) = &text_style.background {
-        style = style.bg(tui_color(background.resolve(env).get()));
+        style = style.bg(tui_color(background.resolve(env).snapshot()));
     }
     style
 }

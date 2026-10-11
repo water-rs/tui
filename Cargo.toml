@@ -8,18 +8,18 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-waterui-core = "0.3.2"
-waterui-backend-core = { version = "0.1.2", default-features = false }
-waterui-layout = "0.3.2"
-waterui-text = "0.4.1"
-waterui-controls = "0.3.2"
-waterui-graphics = { version = "0.4.1", default-features = false, features = ["gpu"] }
-waterui-icon = "0.3.2"
-waterui-internal = { version = "0.4.1", default-features = false }
-waterui-form = "0.3.2"
-waterui-navigation = "0.3.2"
-waterui-shape = "0.1.2"
-nami = "0.11.2"
+waterui-core = "0.5.1"
+waterui-backend-core = { version = "0.5.2", default-features = false }
+waterui-layout = "0.5.1"
+waterui-text = "0.5.1"
+waterui-controls = "0.5.1"
+waterui-graphics = { version = "0.5.1", default-features = false, features = ["cpu", "gpu"] }
+waterui-icon = "0.5.1"
+waterui-internal = { version = "0.5.1", default-features = false }
+waterui-form = "0.5.1"
+waterui-navigation = "0.5.1"
+waterui-shape = "0.5.1"
+nami = "0.12"
 executor-core = { version = "0.7.1", features = ["std"] }
 native-executor = "0.8.0"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "scrolling-regions"] }
@@ -34,8 +34,8 @@ flate2 = "1.1"
 rustix = { version = "1.1.4", features = ["process", "termios"] }
 
 [dev-dependencies]
-aither-acp = "0.4"
-aither-mcp = "0.4"
+aither-acp = "0.6"
+aither-mcp = "0.6"
 async-channel = "2"
 async-process = "2.5.0"
 event-listener = "5.4.2"
@@ -43,7 +43,7 @@ futures-lite = "2.6.1"
 shell-escape = "0.1"
 strip-ansi-escapes = "0.2.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-waterui-text = { version = "0.4.1", features = ["markdown"] }
+waterui-text = { version = "0.5.1", features = ["markdown"] }
 
 # This repository develops against the WaterUI checkout next door; the patch
 # table is what keeps the version requirements above resolving to it. A

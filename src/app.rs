@@ -73,7 +73,12 @@ pub fn run<V: View>(view: impl FnOnce() -> V) -> io::Result<()> {
 /// Returns terminal I/O errors from `crossterm`/`ratatui`.
 pub fn run_app(app: impl FnOnce() -> App) -> io::Result<()> {
     let wake = init_executors();
-    let (mut windows, _menu_bar, mut env) = app().into_parts();
+    let waterui_internal::app::AppParts {
+        mut windows,
+        menu_bar: _,
+        mut env,
+        ..
+    } = app().into_parts();
     install_terminal_theme(&mut env);
     assert!(
         windows.len() == 1,
@@ -97,7 +102,7 @@ enum Wake {
     Input(Event),
     /// The reader thread's `event::read` failed — the terminal is gone.
     InputEof,
-    /// A `GpuSurface` redraw handle fired between frames.
+    /// A `GpuContentView`/scene redraw request fired between frames.
     Repaint,
 }
 
@@ -116,11 +121,13 @@ struct WakeBus {
 fn init_executors() -> WakeBus {
     let (tx, rx) = mpsc::channel();
     let _ = executor_core::try_init_global_executor(native_executor::NativeExecutor::new());
-    let _ = executor_core::try_init_local_executor(
-        waterui_internal::task::monitored_local_executor(TuiLocalExecutor {
-            wake_tx: tx.clone(),
-        }),
-    );
+    let _ =
+        executor_core::try_init_local_executor(waterui_internal::task::monitored_local_executor(
+            TuiLocalExecutor {
+                wake_tx: tx.clone(),
+            },
+            waterui_internal::task::RefreshRate::HEADLESS,
+        ));
     WakeBus { tx, rx }
 }
 
